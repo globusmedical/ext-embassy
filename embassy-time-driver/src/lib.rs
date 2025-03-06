@@ -46,15 +46,19 @@
 //!
 //! Then, you'll need to adapt the `schedule_wake` method to use this queue.
 //!
-//! ```ignore
+//! Note that if you are using multiple queues, you will need to ensure that a single timer
+//! queue item is only ever enqueued into a single queue at a time.
+//!
+//! ```
 //! use core::cell::RefCell;
 //! use core::task::Waker;
 //!
-//! use embassy_time_queue_driver::Queue;
+//! use critical_section::{CriticalSection, Mutex};
+//! use embassy_time_queue_utils::Queue;
 //! use embassy_time_driver::Driver;
 //!
 //! struct MyDriver {
-//!     timer_queue: critical_section::Mutex<RefCell<Queue>>,
+//!     queue: Mutex<RefCell<Queue>>,
 //! }
 //!
 //! impl MyDriver {
@@ -64,14 +68,14 @@
 //! }
 //!
 //! impl Driver for MyDriver {
-//!     // fn now(&self) -> u64 { ... }
+//!     fn now(&self) -> u64 { todo!() }
 //!
 //!     fn schedule_wake(&self, at: u64, waker: &Waker) {
 //!         critical_section::with(|cs| {
 //!             let mut queue = self.queue.borrow(cs).borrow_mut();
 //!             if queue.schedule_wake(at, waker) {
 //!                 let mut next = queue.next_expiration(self.now());
-//!                 while !self.set_alarm(cs, next) {
+//!                 while !self.set_alarm(&cs, next) {
 //!                     next = queue.next_expiration(self.now());
 //!                 }
 //!             }
@@ -131,11 +135,19 @@ pub trait Driver: Send + Sync + 'static {
 
 extern "Rust" {
     fn _embassy_time_now() -> u64;
+    fn _embassy_time_schedule_wake(at: u64, waker: &Waker);
 }
 
 /// See [`Driver::now`]
+#[inline]
 pub fn now() -> u64 {
     unsafe { _embassy_time_now() }
+}
+
+/// Schedule the given waker to be woken at `at`.
+#[inline]
+pub fn schedule_wake(at: u64, waker: &Waker) {
+    unsafe { _embassy_time_schedule_wake(at, waker) }
 }
 
 /// Set the time Driver implementation.
@@ -147,11 +159,13 @@ macro_rules! time_driver_impl {
         static $name: $t = $val;
 
         #[no_mangle]
+        #[inline]
         fn _embassy_time_now() -> u64 {
             <$t as $crate::Driver>::now(&$name)
         }
 
         #[no_mangle]
+        #[inline]
         fn _embassy_time_schedule_wake(at: u64, waker: &core::task::Waker) {
             <$t as $crate::Driver>::schedule_wake(&$name, at, waker);
         }

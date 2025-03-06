@@ -38,6 +38,44 @@ pub use self::waker::task_from_waker;
 use super::SpawnToken;
 
 /// Raw task header for use in task pointers.
+///
+/// A task can be in one of the following states:
+///
+/// - Not spawned: the task is ready to spawn.
+/// - `SPAWNED`: the task is currently spawned and may be running.
+/// - `RUN_ENQUEUED`: the task is enqueued to be polled. Note that the task may be `!SPAWNED`.
+///    In this case, the `RUN_ENQUEUED` state will be cleared when the task is next polled, without
+///    polling the task's future.
+///
+/// A task's complete life cycle is as follows:
+///
+/// ```text
+/// ┌────────────┐   ┌────────────────────────┐
+/// │Not spawned │◄─5┤Not spawned|Run enqueued│
+/// │            ├6─►│                        │
+/// └─────┬──────┘   └──────▲─────────────────┘
+///       1                 │
+///       │    ┌────────────┘
+///       │    4
+/// ┌─────▼────┴─────────┐
+/// │Spawned|Run enqueued│
+/// │                    │
+/// └─────┬▲─────────────┘
+///       2│
+///       │3
+/// ┌─────▼┴─────┐
+/// │  Spawned   │
+/// │            │
+/// └────────────┘
+/// ```
+///
+/// Transitions:
+/// - 1: Task is spawned - `AvailableTask::claim -> Executor::spawn`
+/// - 2: During poll - `RunQueue::dequeue_all -> State::run_dequeue`
+/// - 3: Task wakes itself, waker wakes task, or task exits - `Waker::wake -> wake_task -> State::run_enqueue`
+/// - 4: A run-queued task exits - `TaskStorage::poll -> Poll::Ready`
+/// - 5: Task is dequeued. The task's future is not polled, because exiting the task replaces its `poll_fn`.
+/// - 6: A task is waken when it is not spawned - `wake_task -> State::run_enqueue`
 pub(crate) struct TaskHeader {
     pub(crate) state: State,
     pub(crate) run_queue_item: RunQueueItem,
@@ -96,29 +134,6 @@ impl TaskRef {
         &self.header().timer_queue_item
     }
 
-    /// Mark the task as timer-queued. Return whether it should be actually enqueued
-    /// using `_embassy_time_schedule_wake`.
-    ///
-    /// Entering this state prevents the task from being respawned while in a timer queue.
-    ///
-    /// Safety:
-    ///
-    /// This functions should only be called by the timer queue driver, before
-    /// enqueueing the timer item.
-    pub unsafe fn timer_enqueue(&self) -> timer_queue::TimerEnqueueOperation {
-        self.header().state.timer_enqueue()
-    }
-
-    /// Unmark the task as timer-queued.
-    ///
-    /// Safety:
-    ///
-    /// This functions should only be called by the timer queue implementation, after the task has
-    /// been removed from the timer queue.
-    pub unsafe fn timer_dequeue(&self) {
-        self.header().state.timer_dequeue()
-    }
-
     /// The returned pointer is valid for the entire TaskStorage.
     pub(crate) fn as_ptr(self) -> *const TaskHeader {
         self.ptr.as_ptr()
@@ -144,6 +159,10 @@ impl TaskRef {
 pub struct TaskStorage<F: Future + 'static> {
     raw: TaskHeader,
     future: UninitCell<F>, // Valid if STATE_SPAWNED
+}
+
+unsafe fn poll_exited(_p: TaskRef) {
+    // Nothing to do, the task is already !SPAWNED and dequeued.
 }
 
 impl<F: Future + 'static> TaskStorage<F> {
@@ -187,33 +206,24 @@ impl<F: Future + 'static> TaskStorage<F> {
     }
 
     unsafe fn poll(p: TaskRef) {
-        let this = &*(p.as_ptr() as *const TaskStorage<F>);
+        let this = &*p.as_ptr().cast::<TaskStorage<F>>();
 
         let future = Pin::new_unchecked(this.future.as_mut());
         let waker = waker::from_task(p);
         let mut cx = Context::from_waker(&waker);
         match future.poll(&mut cx) {
             Poll::Ready(_) => {
+                // As the future has finished and this function will not be called
+                // again, we can safely drop the future here.
                 this.future.drop_in_place();
 
-                // Mark this task to be timer queued.
-                // We're splitting the enqueue in two parts, so that we can change task state
-                // to something that prevent re-queueing.
-                let op = this.raw.state.timer_enqueue();
+                // We replace the poll_fn with a despawn function, so that the task is cleaned up
+                // when the executor polls it next.
+                this.raw.poll_fn.set(Some(poll_exited));
 
-                // Now mark the task as not spawned, so that
-                // - it can be spawned again once it has been removed from the timer queue
-                // - it can not be timer-queued again
-                // We must do this before scheduling the wake, to prevent the task from being
-                // dequeued by the time driver while it's still SPAWNED.
+                // Make sure we despawn last, so that other threads can only spawn the task
+                // after we're done with it.
                 this.raw.state.despawn();
-
-                // Now let's finish enqueueing. While we shouldn't get an `Ignore` here, it's
-                // better to be safe.
-                if op == timer_queue::TimerEnqueueOperation::Enqueue {
-                    // Schedule the task in the past, so it gets dequeued ASAP.
-                    unsafe { _embassy_time_schedule_wake(0, &waker) }
-                }
             }
             Poll::Pending => {}
         }
@@ -230,10 +240,6 @@ impl<F: Future + 'static> TaskStorage<F> {
 
         assert_sync(self)
     }
-}
-
-extern "Rust" {
-    fn _embassy_time_schedule_wake(at: u64, waker: &core::task::Waker);
 }
 
 /// An uninitialized [`TaskStorage`].
@@ -416,15 +422,6 @@ impl SyncExecutor {
     pub(crate) unsafe fn poll(&'static self) {
         self.run_queue.dequeue_all(|p| {
             let task = p.header();
-
-            if !task.state.run_dequeue() {
-                // If task is not running, ignore it. This can happen in the following scenario:
-                //   - Task gets dequeued, poll starts
-                //   - While task is being polled, it gets woken. It gets placed in the queue.
-                //   - Task poll finishes, returning done=true
-                //   - RUNNING bit is cleared, but the task is already in the queue.
-                return;
-            }
 
             #[cfg(feature = "trace")]
             trace::task_exec_begin(self, &p);

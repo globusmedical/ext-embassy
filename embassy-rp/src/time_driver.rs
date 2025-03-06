@@ -5,7 +5,7 @@ use critical_section::CriticalSection;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_time_driver::Driver;
-use embassy_time_queue_driver::Queue;
+use embassy_time_queue_utils::Queue;
 #[cfg(feature = "rp2040")]
 use pac::TIMER;
 #[cfg(feature = "_rp235x")]
@@ -86,6 +86,9 @@ impl TimerDriver {
     fn check_alarm(&self) {
         let n = 0;
         critical_section::with(|cs| {
+            // clear the irq
+            TIMER.intr().write(|w| w.set_alarm(n, true));
+
             let alarm = &self.alarms.borrow(cs);
             let timestamp = alarm.timestamp.get();
             if timestamp <= self.now() {
@@ -96,9 +99,6 @@ impl TimerDriver {
                 TIMER.alarm(n).write_value(timestamp as u32);
             }
         });
-
-        // clear the irq
-        TIMER.intr().write(|w| w.set_alarm(n, true));
     }
 
     fn trigger_alarm(&self, cs: CriticalSection) {

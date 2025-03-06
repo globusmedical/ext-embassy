@@ -3,14 +3,10 @@ use core::cell::Cell;
 pub(crate) use critical_section::{with as locked, CriticalSection as Token};
 use critical_section::{CriticalSection, Mutex};
 
-use super::timer_queue::TimerEnqueueOperation;
-
 /// Task is spawned (has a future)
 pub(crate) const STATE_SPAWNED: u32 = 1 << 0;
 /// Task is in the executor run queue
 pub(crate) const STATE_RUN_QUEUED: u32 = 1 << 1;
-/// Task is in the executor timer queue
-pub(crate) const STATE_TIMER_QUEUED: u32 = 1 << 2;
 
 pub(crate) struct State {
     state: Mutex<Cell<u32>>,
@@ -60,12 +56,9 @@ impl State {
     pub fn run_enqueue(&self, f: impl FnOnce(Token)) {
         critical_section::with(|cs| {
             if self.update_with_cs(cs, |s| {
-                if (*s & STATE_RUN_QUEUED != 0) || (*s & STATE_SPAWNED == 0) {
-                    false
-                } else {
-                    *s |= STATE_RUN_QUEUED;
-                    true
-                }
+                let ok = *s & STATE_RUN_QUEUED == 0;
+                *s |= STATE_RUN_QUEUED;
+                ok
             }) {
                 f(cs);
             }
@@ -74,32 +67,7 @@ impl State {
 
     /// Unmark the task as run-queued. Return whether the task is spawned.
     #[inline(always)]
-    pub fn run_dequeue(&self) -> bool {
-        self.update(|s| {
-            let ok = *s & STATE_SPAWNED != 0;
-            *s &= !STATE_RUN_QUEUED;
-            ok
-        })
-    }
-
-    /// Mark the task as timer-queued. Return whether it can be enqueued.
-    #[inline(always)]
-    pub fn timer_enqueue(&self) -> TimerEnqueueOperation {
-        self.update(|s| {
-            // FIXME: we need to split SPAWNED into two phases, to prevent enqueueing a task that is
-            // just being spawned, because its executor pointer may still be changing.
-            if *s & STATE_SPAWNED == STATE_SPAWNED {
-                *s |= STATE_TIMER_QUEUED;
-                TimerEnqueueOperation::Enqueue
-            } else {
-                TimerEnqueueOperation::Ignore
-            }
-        })
-    }
-
-    /// Unmark the task as timer-queued.
-    #[inline(always)]
-    pub fn timer_dequeue(&self) {
-        self.update(|s| *s &= !STATE_TIMER_QUEUED);
+    pub fn run_dequeue(&self, cs: CriticalSection<'_>) {
+        self.update_with_cs(cs, |s| *s &= !STATE_RUN_QUEUED)
     }
 }
