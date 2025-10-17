@@ -11,7 +11,7 @@ use super::{
     AdvancedInstance4Channel, Channel, Channel1ComplementaryPin, Channel2ComplementaryPin, Channel3ComplementaryPin,
     Channel4ComplementaryPin,
 };
-use crate::gpio::{AnyPin, OutputType};
+use crate::gpio::{AnyPin, OutputType, Pull};
 use crate::time::Hertz;
 use crate::timer::low_level::OutputCompareMode;
 use crate::Peripheral;
@@ -28,13 +28,17 @@ macro_rules! complementary_channel_impl {
     ($new_chx:ident, $channel:ident, $pin_trait:ident) => {
         impl<'d, T: AdvancedInstance4Channel> ComplementaryPwmPin<'d, T, $channel> {
             #[doc = concat!("Create a new ", stringify!($channel), " complementary PWM pin instance.")]
-            pub fn $new_chx(pin: impl Peripheral<P = impl $pin_trait<T>> + 'd, output_type: OutputType) -> Self {
+            pub fn $new_chx(
+                pin: impl Peripheral<P = impl $pin_trait<T>> + 'd,
+                output_type: OutputType,
+                pull: Pull,
+            ) -> Self {
                 into_ref!(pin);
                 critical_section::with(|_| {
                     pin.set_low();
                     pin.set_as_af(
                         pin.af_num(),
-                        crate::gpio::AfType::output(output_type, crate::gpio::Speed::VeryHigh),
+                        crate::gpio::AfType::output_pull(output_type, crate::gpio::Speed::VeryHigh, pull),
                     );
                 });
                 ComplementaryPwmPin {

@@ -7,7 +7,7 @@ use embassy_hal_internal::{into_ref, PeripheralRef};
 
 use super::low_level::{CountingMode, OutputCompareMode, OutputPolarity, Timer};
 use super::{Channel, Channel1Pin, Channel2Pin, Channel3Pin, Channel4Pin, GeneralInstance4Channel, TimerBits};
-use crate::gpio::{AfType, AnyPin, OutputType, Speed};
+use crate::gpio::{AfType, AnyPin, OutputType, Speed, Pull};
 use crate::time::Hertz;
 use crate::Peripheral;
 
@@ -32,11 +32,15 @@ macro_rules! channel_impl {
     ($new_chx:ident, $channel:ident, $pin_trait:ident) => {
         impl<'d, T: GeneralInstance4Channel> PwmPin<'d, T, $channel> {
             #[doc = concat!("Create a new ", stringify!($channel), " PWM pin instance.")]
-            pub fn $new_chx(pin: impl Peripheral<P = impl $pin_trait<T>> + 'd, output_type: OutputType) -> Self {
+            pub fn $new_chx(
+                pin: impl Peripheral<P = impl $pin_trait<T>> + 'd,
+                output_type: OutputType,
+                pull: Pull,
+            ) -> Self {
                 into_ref!(pin);
                 critical_section::with(|_| {
                     pin.set_low();
-                    pin.set_as_af(pin.af_num(), AfType::output(output_type, Speed::VeryHigh));
+                    pin.set_as_af(pin.af_num(), AfType::output_pull(output_type, Speed::VeryHigh, pull));
                 });
                 PwmPin {
                     _pin: pin.map_into(),
