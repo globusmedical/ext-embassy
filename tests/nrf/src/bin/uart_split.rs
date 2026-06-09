@@ -17,14 +17,14 @@ use {defmt_rtt as _, panic_probe as _};
 async fn main(_spawner: Spawner) {
     let mut p = embassy_nrf::init(Default::default());
     let mut config = uarte::Config::default();
-    config.parity = uarte::Parity::EXCLUDED;
-    config.baudrate = uarte::Baudrate::BAUD9600;
+    config.parity = uarte::Parity::Excluded;
+    config.baudrate = uarte::Baudrate::Baud9600;
 
     let uarte = Uarte::new(
-        &mut peri!(p, UART0),
+        peri!(p, UART0).reborrow(),
+        peri!(p, PIN_A).reborrow(),
+        peri!(p, PIN_B).reborrow(),
         irqs!(UART0),
-        &mut peri!(p, PIN_A),
-        &mut peri!(p, PIN_B),
         config.clone(),
     );
     let (mut tx, mut rx) = uarte.split();

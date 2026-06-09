@@ -1,6 +1,6 @@
 //! This example test the RP Pico on board LED.
 //!
-//! It does not work with the RP Pico W board. See wifi_blinky.rs.
+//! It does not work with the RP Pico W board. See `blinky_wifi.rs`.
 
 #![no_std]
 #![no_main]
@@ -13,8 +13,8 @@ use gpio::{Level, Output};
 use {defmt_rtt as _, panic_probe as _};
 
 // Program metadata for `picotool info`.
-// This isn't needed, but it's recomended to have these minimal entries.
-#[link_section = ".bi_entries"]
+// This isn't needed, but it's recommended to have these minimal entries.
+#[unsafe(link_section = ".bi_entries")]
 #[used]
 pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 4] = [
     embassy_rp::binary_info::rp_program_name!(c"Blinky Example"),

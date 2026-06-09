@@ -1,5 +1,5 @@
 use core::cell::RefCell;
-use core::future::{poll_fn, Future};
+use core::future::{Future, poll_fn};
 use core::task::Poll;
 
 use embassy_sync::waitqueue::WakerRegistration;
@@ -23,16 +23,23 @@ pub struct Shared(RefCell<SharedInner>);
 
 struct SharedInner {
     ioctl: IoctlState,
-    is_init: bool,
+    state: ControlState,
     control_waker: WakerRegistration,
     runner_waker: WakerRegistration,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ControlState {
+    Init,
+    Reboot,
+    Ready,
 }
 
 impl Shared {
     pub fn new() -> Self {
         Self(RefCell::new(SharedInner {
             ioctl: IoctlState::Done { resp_len: 0 },
-            is_init: false,
+            state: ControlState::Init,
             control_waker: WakerRegistration::new(),
             runner_waker: WakerRegistration::new(),
         }))
@@ -50,27 +57,24 @@ impl Shared {
         })
     }
 
-    pub async fn ioctl_wait_pending(&self) -> PendingIoctl {
-        let pending = poll_fn(|cx| {
+    pub fn ioctl_wait_pending(&self) -> impl Future<Output = PendingIoctl> + '_ {
+        poll_fn(|cx| {
             let mut this = self.0.borrow_mut();
             if let IoctlState::Pending(pending) = this.ioctl {
+                this.ioctl = IoctlState::Sent { buf: pending.buf };
                 Poll::Ready(pending)
             } else {
                 this.runner_waker.register(cx.waker());
                 Poll::Pending
             }
         })
-        .await;
-
-        self.0.borrow_mut().ioctl = IoctlState::Sent { buf: pending.buf };
-        pending
     }
 
     pub fn ioctl_cancel(&self) {
         self.0.borrow_mut().ioctl = IoctlState::Done { resp_len: 0 };
     }
 
-    pub async fn ioctl(&self, buf: &mut [u8], req_len: usize) -> usize {
+    pub fn ioctl(&self, buf: &mut [u8], req_len: usize) -> impl Future<Output = usize> + '_ {
         trace!("ioctl req bytes: {:02x}", Bytes(&buf[..req_len]));
 
         {
@@ -79,7 +83,7 @@ impl Shared {
             this.runner_waker.wake();
         }
 
-        self.ioctl_wait_complete().await
+        self.ioctl_wait_complete()
     }
 
     pub fn ioctl_done(&self, response: &[u8]) {
@@ -99,18 +103,30 @@ impl Shared {
         }
     }
 
+    // ota
+    pub fn ota_done(&self) {
+        let mut this = self.0.borrow_mut();
+        this.state = ControlState::Reboot;
+    }
+
     // // // // // // // // // // // // // // // // // // // //
+    //
+    // check if ota is in progress
+    pub(crate) fn state(&self) -> ControlState {
+        let this = self.0.borrow();
+        this.state
+    }
 
     pub fn init_done(&self) {
         let mut this = self.0.borrow_mut();
-        this.is_init = true;
+        this.state = ControlState::Ready;
         this.control_waker.wake();
     }
 
     pub fn init_wait(&self) -> impl Future<Output = ()> + '_ {
         poll_fn(|cx| {
             let mut this = self.0.borrow_mut();
-            if this.is_init {
+            if let ControlState::Ready = this.state {
                 Poll::Ready(())
             } else {
                 this.control_waker.register(cx.waker());

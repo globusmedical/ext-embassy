@@ -16,8 +16,8 @@ bind_interrupts!(struct Irqs {
 async fn main(_spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
     let mut config = uarte::Config::default();
-    config.parity = uarte::Parity::EXCLUDED;
-    config.baudrate = uarte::Baudrate::BAUD115200;
+    config.parity = uarte::Parity::Excluded;
+    config.baudrate = uarte::Baudrate::Baud115200;
 
     let mut tx_buffer = [0u8; 4096];
     let mut rx_buffer = [0u8; 4096];
@@ -28,9 +28,9 @@ async fn main(_spawner: Spawner) {
         p.PPI_CH0,
         p.PPI_CH1,
         p.PPI_GROUP0,
-        Irqs,
         p.P0_08,
         p.P0_06,
+        Irqs,
         config,
         &mut rx_buffer,
         &mut tx_buffer,

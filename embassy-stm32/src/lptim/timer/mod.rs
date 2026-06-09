@@ -1,7 +1,7 @@
 //! Low-level timer driver.
 mod prescaler;
 
-use embassy_hal_internal::{into_ref, Peripheral, PeripheralRef};
+use embassy_hal_internal::Peri;
 
 #[cfg(any(lptim_v2a, lptim_v2b))]
 use super::channel::Channel;
@@ -12,19 +12,18 @@ pub use channel_direction::ChannelDirection;
 use prescaler::Prescaler;
 
 use super::Instance;
+use crate::pac::lptim::vals::{Filter, Trigen};
 use crate::rcc;
 use crate::time::Hertz;
 
 /// Low-level timer driver.
 pub struct Timer<'d, T: Instance> {
-    _tim: PeripheralRef<'d, T>,
+    _tim: Peri<'d, T>,
 }
 
 impl<'d, T: Instance> Timer<'d, T> {
     /// Create a new timer driver.
-    pub fn new(tim: impl Peripheral<P = T> + 'd) -> Self {
-        into_ref!(tim);
-
+    pub fn new(tim: Peri<'d, T>) -> Self {
         rcc::enable_and_reset::<T>();
 
         Self { _tim: tim }
@@ -80,6 +79,34 @@ impl<'d, T: Instance> Timer<'d, T> {
         T::frequency()
     }
 
+    /// Select the trigger source used when external trigger start is enabled.
+    ///
+    /// The source index maps to device-specific `lptim_ext_trigX` inputs (0..=7).
+    pub fn set_trigger_source(&self, source: u8) {
+        assert!(source < 8, "LPTIM trigger source must be in range 0..8");
+        T::regs().cfgr().modify(|r| r.set_trigsel(source));
+    }
+
+    /// Configure how trigger edges start the counter.
+    ///
+    /// Use [`Trigen::Software`] for software start. Any edge mode enables
+    /// external trigger start.
+    pub fn set_trigger_mode(&self, mode: Trigen) {
+        T::regs().cfgr().modify(|r| r.set_trigen(mode));
+    }
+
+    /// Configure the digital filter applied to trigger input transitions.
+    pub fn set_trigger_filter(&self, filter: Filter) {
+        T::regs().cfgr().modify(|r| r.set_trgflt(filter));
+    }
+
+    /// Convenience helper to enable external trigger start with source, edge and filter.
+    pub fn configure_external_trigger(&self, source: u8, edge: Trigen, filter: Filter) {
+        self.set_trigger_source(source);
+        self.set_trigger_filter(filter);
+        self.set_trigger_mode(edge);
+    }
+
     /// Get max compare value. This depends on the timer frequency and the clock frequency from RCC.
     pub fn get_max_compare_value(&self) -> u16 {
         T::regs().arr().read().arr()
@@ -117,6 +144,31 @@ impl<'d, T: Instance> Timer<'d, T> {
             .ccmr(0)
             .modify(|w| w.set_ccsel(channel.index(), direction.into()));
     }
+
+    /// Enable the timer interrupt.
+    pub fn enable_interrupt(&self) {
+        T::regs().dier().modify(|w| w.set_arrmie(true));
+    }
+
+    /// Disable the timer interrupt.
+    pub fn disable_interrupt(&self) {
+        T::regs().dier().modify(|w| w.set_arrmie(false));
+    }
+
+    /// Check if the timer interrupt is enabled.
+    pub fn is_interrupt_enabled(&self) -> bool {
+        T::regs().dier().read().arrmie()
+    }
+
+    /// Check if the timer interrupt is pending.
+    pub fn is_interrupt_pending(&self) -> bool {
+        T::regs().isr().read().arrm()
+    }
+
+    /// Clear the timer interrupt.
+    pub fn clear_interrupt(&self) {
+        T::regs().icr().write(|w| w.set_arrmcf(true));
+    }
 }
 
 #[cfg(not(any(lptim_v2a, lptim_v2b)))]
@@ -129,5 +181,30 @@ impl<'d, T: Instance> Timer<'d, T> {
     /// Get compare value for a channel.
     pub fn get_compare_value(&self) -> u16 {
         T::regs().cmp().read().cmp()
+    }
+
+    /// Enable the timer interrupt.
+    pub fn enable_interrupt(&self) {
+        T::regs().ier().modify(|w| w.set_arrmie(true));
+    }
+
+    /// Disable the timer interrupt.
+    pub fn disable_interrupt(&self) {
+        T::regs().ier().modify(|w| w.set_arrmie(false));
+    }
+
+    /// Check if the timer interrupt is enabled.
+    pub fn is_interrupt_enabled(&self) -> bool {
+        T::regs().ier().read().arrmie()
+    }
+
+    /// Check if the timer interrupt is pending.
+    pub fn is_interrupt_pending(&self) -> bool {
+        T::regs().isr().read().arrm()
+    }
+
+    /// Clear the timer interrupt.
+    pub fn clear_interrupt(&self) {
+        T::regs().icr().write(|w| w.set_arrmcf(true));
     }
 }

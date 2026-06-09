@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(unsafe_op_in_unsafe_fn)]
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 #![deny(unused_must_use)]
@@ -9,12 +10,12 @@ mod fmt;
 pub mod context;
 
 use core::cell::RefCell;
-use core::future::{poll_fn, Future};
+use core::future::{Future, poll_fn};
 use core::marker::PhantomData;
 use core::mem::{self, MaybeUninit};
 use core::ptr::{self, addr_of, addr_of_mut, copy_nonoverlapping};
 use core::slice;
-use core::sync::atomic::{compiler_fence, fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence, fence};
 use core::task::{Poll, Waker};
 
 use cortex_m::peripheral::NVIC;
@@ -119,14 +120,16 @@ async fn new_internal<'a>(
     let shmem_ptr = shmem.as_mut_ptr() as *mut u8;
 
     const SPU_REGION_SIZE: usize = 8192; // 8kb
-    assert!(shmem_len != 0);
+    trace!("  shmem_ptr = {}, shmem_len = {}", shmem_ptr, shmem_len);
+
+    assert!(shmem_len != 0, "shmem length must not be zero");
     assert!(
         shmem_len % SPU_REGION_SIZE == 0,
         "shmem length must be a multiple of 8kb"
     );
     assert!(
         (shmem_ptr as usize) % SPU_REGION_SIZE == 0,
-        "shmem length must be a multiple of 8kb"
+        "shmem pointer must be 8kb-aligned"
     );
     assert!(
         (shmem_ptr as usize + shmem_len) < 0x2002_0000,
@@ -135,8 +138,13 @@ async fn new_internal<'a>(
 
     let spu = pac::SPU_S;
     debug!("Setting IPC RAM as nonsecure...");
+    trace!(
+        "  SPU_REGION_SIZE={}, shmem_ptr=0x{:08X}, shmem_len={}",
+        SPU_REGION_SIZE, shmem_ptr as usize, shmem_len
+    );
     let region_start = (shmem_ptr as usize - 0x2000_0000) / SPU_REGION_SIZE;
     let region_end = region_start + shmem_len / SPU_REGION_SIZE;
+    trace!("  region_start={}, region_end={}", region_start, region_end);
     for i in region_start..region_end {
         spu.ramregion(i).perm().write(|w| {
             w.set_execute(true);
@@ -154,13 +162,17 @@ async fn new_internal<'a>(
         end: unsafe { shmem_ptr.add(shmem_len) },
         _phantom: PhantomData,
     };
-
-    let ipc = pac::IPC_NS;
-    let power = pac::POWER_S;
+    trace!(
+        "  Allocator: start=0x{:08X}, end=0x{:08X}",
+        alloc.start as usize, alloc.end as usize
+    );
 
     let cb: &mut ControlBlock = alloc.alloc().write(unsafe { mem::zeroed() });
+
     let rx = alloc.alloc_bytes(RX_SIZE);
+    trace!("  RX buffer at {}, size={}", rx.as_ptr(), RX_SIZE);
     let trace = alloc.alloc_bytes(TRACE_SIZE);
+    trace!("  Trace buffer at {}, size={}", trace.as_ptr(), TRACE_SIZE);
 
     cb.version = 0x00010000;
     cb.rx_base = rx.as_mut_ptr() as _;
@@ -174,8 +186,10 @@ async fn new_internal<'a>(
     cb.trace.base = trace.as_mut_ptr() as _;
     cb.trace.size = TRACE_SIZE;
 
+    let ipc = pac::IPC_NS;
     ipc.gpmem(0).write_value(cb as *mut _ as u32);
     ipc.gpmem(1).write_value(0);
+    trace!("  GPMEM[0]={:#X}, GPMEM[1]={}", cb as *mut _ as u32, 0);
 
     // connect task/event i to channel i
     for i in 0..8 {
@@ -185,10 +199,11 @@ async fn new_internal<'a>(
 
     compiler_fence(Ordering::SeqCst);
 
-    // POWER.LTEMODEM.STARTN = 0
-    // The reg is missing in the PAC??
-    let startn = unsafe { (power.as_ptr() as *mut u32).add(0x610 / 4) };
-    unsafe { startn.write_volatile(0) }
+    let power = pac::POWER_S;
+    power
+        .ltemodem()
+        .startn()
+        .write(|w| w.set_startn(pac::power::vals::Startn::Start));
 
     unsafe { NVIC::unmask(pac::Interrupt::IPC) };
 
@@ -202,6 +217,8 @@ async fn new_internal<'a>(
 
         rx_control_list: ptr::null_mut(),
         rx_data_list: ptr::null_mut(),
+        rx_control_len: 0,
+        rx_data_len: 0,
         rx_seq_no: 0,
         rx_check: PointerChecker {
             start: rx.as_mut_ptr() as *mut u8,
@@ -219,11 +236,13 @@ async fn new_internal<'a>(
         },
     }));
 
-    let control = Control { state: state_inner };
-
     let (ch_runner, device) = ch::new(&mut state.ch, ch::driver::HardwareAddress::Ip);
     let state_ch = ch_runner.state_runner();
-    state_ch.set_link_state(ch::driver::LinkState::Up);
+
+    let control = Control {
+        state: state_inner,
+        state_ch,
+    };
 
     let (trace_reader, trace_writer) = if let Some(trace) = trace_buffer {
         let (r, w) = trace.trace.split();
@@ -294,7 +313,7 @@ struct PendingRequest {
     waker: Waker,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 struct NoFreeBufs;
 
@@ -310,6 +329,10 @@ struct StateInner {
 
     rx_control_list: *mut List,
     rx_data_list: *mut List,
+    /// Number of entries in the control list
+    rx_control_len: usize,
+    /// Number of entries in the data list
+    rx_data_len: usize,
     rx_seq_no: u16,
     rx_check: PointerChecker,
 
@@ -346,8 +369,11 @@ impl StateInner {
                 self.rx_data_list = desc.data_list_ptr;
                 let rx_control_len = unsafe { addr_of!((*self.rx_control_list).len).read_volatile() };
                 let rx_data_len = unsafe { addr_of!((*self.rx_data_list).len).read_volatile() };
-                assert_eq!(rx_control_len, LIST_LEN);
-                assert_eq!(rx_data_len, LIST_LEN);
+
+                trace!("modem control list length: {}", rx_control_len);
+                trace!("modem data    list length: {}", rx_data_len);
+                self.rx_control_len = rx_control_len;
+                self.rx_data_len = rx_data_len;
                 self.init = true;
 
                 debug!("IPC initialized OK!");
@@ -463,7 +489,12 @@ impl StateInner {
 
     fn process(&mut self, list: *mut List, is_control: bool, ch: &mut ch::Runner<MTU>) -> bool {
         let mut did_work = false;
-        for i in 0..LIST_LEN {
+        let max = if is_control {
+            self.rx_control_len
+        } else {
+            self.rx_data_len
+        };
+        for i in 0..max {
             let item_ptr = unsafe { addr_of_mut!((*list).items[i]) };
             let preamble = unsafe { addr_of!((*item_ptr).state).read_volatile() };
             if preamble & 0xFF == 0x01 && preamble >> 16 == self.rx_seq_no as u32 {
@@ -625,7 +656,7 @@ impl StateInner {
                     9 => match (msg.id >> 16) & 0xFFF {
                         // IP receive notification
                         1 => {
-                            if let Some(buf) = ch.try_rx_buf() {
+                            if let Some(mut buf) = ch.try_rx_buf() {
                                 let mut len = msg.data_len;
                                 if len > buf.len() {
                                     warn!("truncating rx'd packet from {} to {} bytes", len, buf.len());
@@ -634,7 +665,7 @@ impl StateInner {
                                 fence(Ordering::SeqCst); // synchronize volatile accesses with the nonvolatile copy_nonoverlapping.
                                 unsafe { ptr::copy_nonoverlapping(msg.data, buf.as_mut_ptr(), len) }
                                 fence(Ordering::SeqCst); // synchronize volatile accesses with the nonvolatile copy_nonoverlapping.
-                                ch.rx_done(len);
+                                buf.rx_done(len);
                             }
                             false
                         }
@@ -733,6 +764,7 @@ impl PointerChecker {
 /// You can use this object to control the modem at runtime, such as running AT commands.
 pub struct Control<'a> {
     state: &'a RefCell<StateInner>,
+    state_ch: ch::StateRunner<'a>,
 }
 
 impl<'a> Control<'a> {
@@ -907,6 +939,10 @@ impl<'a> Control<'a> {
         let status = u32::from_le_bytes(msg.param[8..12].try_into().unwrap());
         assert_eq!(status, 0);
     }
+
+    fn set_link_state(&self, state: ch::driver::LinkState) {
+        self.state_ch.set_link_state(state);
+    }
 }
 
 /// Background runner for the driver.
@@ -934,10 +970,10 @@ impl<'a> Runner<'a> {
                     msg.id = 0x7006_0004; // IP send
                     msg.param_len = 12;
                     msg.param[4..8].copy_from_slice(&fd.to_le_bytes());
-                    if let Err(e) = state.send_message(&mut msg, buf) {
+                    if let Err(e) = state.send_message(&mut msg, &buf) {
                         warn!("tx failed: {:?}", e);
                     }
-                    self.ch.tx_done();
+                    buf.tx_done();
                 }
             }
 
@@ -947,7 +983,7 @@ impl<'a> Runner<'a> {
     }
 }
 
-const LIST_LEN: usize = 16;
+const LIST_LEN: usize = 32;
 
 #[repr(C)]
 struct ControlBlock {
@@ -1032,7 +1068,8 @@ struct ListItem {
 }
 
 #[repr(C)]
-#[derive(defmt::Format, Clone, Copy)]
+#[derive(Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 struct Message {
     id: u32,
 

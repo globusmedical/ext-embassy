@@ -1,14 +1,106 @@
 //! Quadrature decoder using a timer.
 
-use core::marker::PhantomData;
-
-use embassy_hal_internal::{into_ref, PeripheralRef};
-use stm32_metapac::timer::vals;
+use stm32_metapac::timer::vals::{self, Sms};
 
 use super::low_level::Timer;
-use super::{Channel1Pin, Channel2Pin, GeneralInstance4Channel};
-use crate::gpio::{AfType, AnyPin, Pull};
-use crate::Peripheral;
+pub use super::{Ch1, Ch2};
+use super::{GeneralInstance4Channel, TimerPin};
+use crate::Peri;
+use crate::gpio::{AfType, Flex, Pull};
+use crate::timer::TimerChannel;
+
+/// Qei driver config.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Clone, Copy)]
+pub struct Config {
+    /// Configures the internal pull up/down resistor for Qei's channel 1 pin.
+    pub ch1_pull: Pull,
+    /// Configures the internal pull up/down resistor for Qei's channel 2 pin.
+    pub ch2_pull: Pull,
+    /// Specifies the encoder mode to use for the Qei peripheral.
+    pub mode: QeiMode,
+    /// Sets the auto-reload value for the counter.
+    pub auto_reload: u16,
+}
+
+impl Default for Config {
+    /// Arbitrary defaults to preserve backwards compatibility
+    fn default() -> Self {
+        Self {
+            ch1_pull: Pull::None,
+            ch2_pull: Pull::None,
+            mode: QeiMode::Mode3,
+            auto_reload: u16::MAX,
+        }
+    }
+}
+
+/// Advanced QEI configuration.
+///
+/// This extends [`Config`] with optional encoder-index controls on timer variants
+/// that expose TIMx_ECR/TIMx_SR index fields.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Clone, Copy, Default)]
+pub struct AdvancedConfig {
+    /// Base QEI configuration.
+    pub base: Config,
+    /// Optional index behavior configuration.
+    #[cfg(timer_v2)]
+    pub index: Option<IndexConfig>,
+    /// Enable index event interrupt.
+    #[cfg(timer_v2)]
+    pub enable_index_interrupt: bool,
+    /// Enable direction-change interrupt.
+    #[cfg(timer_v2)]
+    pub enable_direction_change_interrupt: bool,
+}
+
+impl From<Config> for AdvancedConfig {
+    fn from(base: Config) -> Self {
+        Self {
+            base,
+            #[cfg(timer_v2)]
+            index: None,
+            #[cfg(timer_v2)]
+            enable_index_interrupt: false,
+            #[cfg(timer_v2)]
+            enable_direction_change_interrupt: false,
+        }
+    }
+}
+
+/// See STMicro AN4013 for §2.3 for more information
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Clone, Copy)]
+pub enum QeiMode {
+    /// Direct alias for [`Sms::ENCODER_MODE_1`]
+    Mode1,
+    /// Direct alias for [`Sms::ENCODER_MODE_2`]
+    Mode2,
+    /// Direct alias for [`Sms::ENCODER_MODE_3`]
+    Mode3,
+}
+
+impl From<QeiMode> for Sms {
+    fn from(mode: QeiMode) -> Self {
+        match mode {
+            QeiMode::Mode1 => Sms::EncoderMode1,
+            QeiMode::Mode2 => Sms::EncoderMode2,
+            QeiMode::Mode3 => Sms::EncoderMode3,
+        }
+    }
+}
+
+#[cfg(timer_v2)]
+/// Encoder index configuration (TIMx_ECR fields).
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Clone, Copy)]
+pub struct IndexConfig {
+    /// Index-direction selection.
+    pub direction: vals::Idir,
+    /// Index position selection.
+    pub position: vals::Fidx,
+}
 
 /// Counting direction
 pub enum Direction {
@@ -18,58 +110,58 @@ pub enum Direction {
     Downcounting,
 }
 
-/// Channel 1 marker type.
-pub enum Ch1 {}
-/// Channel 2 marker type.
-pub enum Ch2 {}
+trait SealedQeiChannel: TimerChannel {}
 
-/// Wrapper for using a pin with QEI.
-pub struct QeiPin<'d, T, Channel> {
-    _pin: PeripheralRef<'d, AnyPin>,
-    phantom: PhantomData<(T, Channel)>,
-}
+/// Marker trait for a timer channel eligible for use with QEI.
+#[expect(private_bounds)]
+pub trait QeiChannel: SealedQeiChannel {}
 
-macro_rules! channel_impl {
-    ($new_chx:ident, $channel:ident, $pin_trait:ident) => {
-        impl<'d, T: GeneralInstance4Channel> QeiPin<'d, T, $channel> {
-            #[doc = concat!("Create a new ", stringify!($channel), " QEI pin instance.")]
-            pub fn $new_chx(pin: impl Peripheral<P = impl $pin_trait<T>> + 'd) -> Self {
-                into_ref!(pin);
-                critical_section::with(|_| {
-                    pin.set_low();
-                    pin.set_as_af(pin.af_num(), AfType::input(Pull::None));
-                });
-                QeiPin {
-                    _pin: pin.map_into(),
-                    phantom: PhantomData,
-                }
-            }
-        }
-    };
-}
+impl QeiChannel for Ch1 {}
+impl QeiChannel for Ch2 {}
 
-channel_impl!(new_ch1, Ch1, Channel1Pin);
-channel_impl!(new_ch2, Ch2, Channel2Pin);
+impl SealedQeiChannel for Ch1 {}
+impl SealedQeiChannel for Ch2 {}
 
 /// Quadrature decoder driver.
 pub struct Qei<'d, T: GeneralInstance4Channel> {
     inner: Timer<'d, T>,
+    _ch1: Flex<'d>,
+    _ch2: Flex<'d>,
 }
 
 impl<'d, T: GeneralInstance4Channel> Qei<'d, T> {
-    /// Create a new quadrature decoder driver.
-    pub fn new(tim: impl Peripheral<P = T> + 'd, _ch1: QeiPin<'d, T, Ch1>, _ch2: QeiPin<'d, T, Ch2>) -> Self {
-        Self::new_inner(tim)
+    /// Create a new quadrature decoder driver, with a given [`Config`].
+    #[allow(unused)]
+    pub fn new<CH1: QeiChannel, CH2: QeiChannel, #[cfg(afio)] A>(
+        tim: Peri<'d, T>,
+        ch1: Peri<'d, if_afio!(impl TimerPin<T, CH1, A>)>,
+        ch2: Peri<'d, if_afio!(impl TimerPin<T, CH2, A>)>,
+        config: Config,
+    ) -> Self {
+        Self::new_advanced(tim, ch1, ch2, config.into())
     }
 
-    fn new_inner(tim: impl Peripheral<P = T> + 'd) -> Self {
+    /// Create a new quadrature decoder driver with extended encoder options.
+    #[allow(unused)]
+    pub fn new_advanced<CH1: QeiChannel, CH2: QeiChannel, #[cfg(afio)] A>(
+        tim: Peri<'d, T>,
+        ch1: Peri<'d, if_afio!(impl TimerPin<T, CH1, A>)>,
+        ch2: Peri<'d, if_afio!(impl TimerPin<T, CH2, A>)>,
+        config: AdvancedConfig,
+    ) -> Self {
+        // Configure the pins to be used for the QEI peripheral.
+        critical_section::with(|_| {
+            ch1.set_low();
+            ch2.set_low();
+        });
+
         let inner = Timer::new(tim);
         let r = inner.regs_gp16();
 
         // Configure TxC1 and TxC2 as captures
         r.ccmr_input(0).modify(|w| {
-            w.set_ccs(0, vals::CcmrInputCcs::TI4);
-            w.set_ccs(1, vals::CcmrInputCcs::TI4);
+            w.set_ccs(0, vals::CcmrInputCcs::Ti4);
+            w.set_ccs(1, vals::CcmrInputCcs::Ti4);
         });
 
         // enable and configure to capture on rising edge
@@ -82,25 +174,70 @@ impl<'d, T: GeneralInstance4Channel> Qei<'d, T> {
         });
 
         r.smcr().modify(|w| {
-            w.set_sms(vals::Sms::ENCODER_MODE_3);
+            w.set_sms(config.base.mode.into());
         });
 
-        r.arr().modify(|w| w.set_arr(u16::MAX));
+        r.arr().modify(|w| w.set_arr(config.base.auto_reload));
         r.cr1().modify(|w| w.set_cen(true));
 
-        Self { inner }
+        #[cfg(timer_v2)]
+        if let Some(index) = config.index {
+            inner.set_encoder_index_direction(index.direction);
+            inner.set_encoder_index_position(index.position);
+        }
+
+        #[cfg(timer_v2)]
+        {
+            inner.enable_encoder_index_interrupt(config.enable_index_interrupt);
+            inner.enable_encoder_direction_change_interrupt(config.enable_direction_change_interrupt);
+        }
+
+        Self {
+            inner,
+            _ch1: new_pin!(ch1, AfType::input(config.base.ch1_pull)).unwrap(),
+            _ch2: new_pin!(ch2, AfType::input(config.base.ch2_pull)).unwrap(),
+        }
     }
 
     /// Get direction.
     pub fn read_direction(&self) -> Direction {
         match self.inner.regs_gp16().cr1().read().dir() {
-            vals::Dir::DOWN => Direction::Downcounting,
-            vals::Dir::UP => Direction::Upcounting,
+            vals::Dir::Down => Direction::Downcounting,
+            vals::Dir::Up => Direction::Upcounting,
         }
     }
 
     /// Get count.
     pub fn count(&self) -> u16 {
         self.inner.regs_gp16().cnt().read().cnt()
+    }
+
+    /// Reset count.
+    pub fn reset(&mut self) {
+        self.inner.regs_gp16().cnt().modify(|w| w.set_cnt(0));
+    }
+
+    #[cfg(timer_v2)]
+    /// Check whether an encoder index event interrupt is pending.
+    pub fn index_event_pending(&self) -> bool {
+        self.inner.get_encoder_index_interrupt()
+    }
+
+    #[cfg(timer_v2)]
+    /// Clear encoder index event interrupt pending state.
+    pub fn clear_index_event(&self) {
+        self.inner.clear_encoder_index_interrupt();
+    }
+
+    #[cfg(timer_v2)]
+    /// Check whether a direction-change interrupt is pending.
+    pub fn direction_change_pending(&self) -> bool {
+        self.inner.get_encoder_direction_change_interrupt()
+    }
+
+    #[cfg(timer_v2)]
+    /// Clear direction-change interrupt pending state.
+    pub fn clear_direction_change(&self) {
+        self.inner.clear_encoder_direction_change_interrupt();
     }
 }
