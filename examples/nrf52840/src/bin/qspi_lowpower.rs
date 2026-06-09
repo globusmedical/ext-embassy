@@ -28,23 +28,23 @@ async fn main(_p: Spawner) {
         let mut config = qspi::Config::default();
         config.capacity = 8 * 1024 * 1024; // 8 MB
         config.frequency = Frequency::M32;
-        config.read_opcode = qspi::ReadOpcode::READ4IO;
-        config.write_opcode = qspi::WriteOpcode::PP4IO;
-        config.write_page_size = qspi::WritePageSize::_256BYTES;
+        config.read_opcode = qspi::ReadOpcode::Read4io;
+        config.write_opcode = qspi::WriteOpcode::Pp4io;
+        config.write_page_size = qspi::WritePageSize::_256bytes;
         config.deep_power_down = Some(qspi::DeepPowerDownConfig {
             enter_time: 3, // tDP = 30uS
             exit_time: 3,  // tRDP = 35uS
         });
 
         let mut q = qspi::Qspi::new(
-            &mut p.QSPI,
+            p.QSPI.reborrow(),
             Irqs,
-            &mut p.P0_19,
-            &mut p.P0_17,
-            &mut p.P0_20,
-            &mut p.P0_21,
-            &mut p.P0_22,
-            &mut p.P0_23,
+            p.P0_19.reborrow(),
+            p.P0_17.reborrow(),
+            p.P0_20.reborrow(),
+            p.P0_21.reborrow(),
+            p.P0_22.reborrow(),
+            p.P0_23.reborrow(),
             config,
         );
 

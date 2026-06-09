@@ -4,19 +4,16 @@
 
 use core::marker::PhantomData;
 
-use embassy_hal_internal::{into_ref, PeripheralRef};
 use embassy_sync::waitqueue::AtomicWaker;
 
 use crate::dma::ringbuffer::Error as RingbufferError;
 pub use crate::dma::word;
-#[cfg(not(gpdma))]
-use crate::dma::ReadableRingBuffer;
-use crate::dma::{Channel, TransferOptions};
-use crate::gpio::{AfType, AnyPin, Pull, SealedPin as _};
+use crate::dma::{Channel, ReadableRingBuffer, TransferOptions};
+use crate::gpio::{AfType, Flex, Pull};
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::spdifrx::Spdifrx as Regs;
 use crate::rcc::{RccInfo, SealedRccPeripheral};
-use crate::{interrupt, peripherals, Peripheral};
+use crate::{Peri, interrupt, peripherals};
 
 /// Possible S/PDIF preamble types.
 #[allow(dead_code)]
@@ -36,10 +33,10 @@ enum PreambleType {
 
 macro_rules! new_spdifrx_pin {
     ($name:ident, $af_type:expr) => {{
-        let pin = $name.into_ref();
+        let pin = $name;
         let input_sel = pin.input_sel();
-        pin.set_as_af(pin.af_num(), $af_type);
-        (Some(pin.map_into()), input_sel)
+        set_as_af!(pin, $af_type);
+        (Some(Flex::new(pin)), input_sel)
     }};
 }
 
@@ -59,10 +56,9 @@ macro_rules! impl_spdifrx_pin {
 /// Ring-buffered SPDIFRX driver.
 ///
 /// Data is read by DMAs and stored in a ring buffer.
-#[cfg(not(gpdma))]
 pub struct Spdifrx<'d, T: Instance> {
-    _peri: PeripheralRef<'d, T>,
-    spdifrx_in: Option<PeripheralRef<'d, AnyPin>>,
+    _peri: Peri<'d, T>,
+    _spdifrx_in: Option<Flex<'d>>,
     data_ring_buffer: ReadableRingBuffer<'d, u32>,
 }
 
@@ -119,7 +115,6 @@ impl Default for Config {
     }
 }
 
-#[cfg(not(gpdma))]
 impl<'d, T: Instance> Spdifrx<'d, T> {
     fn dma_opts() -> TransferOptions {
         TransferOptions {
@@ -130,27 +125,37 @@ impl<'d, T: Instance> Spdifrx<'d, T> {
     }
 
     /// Create a new `Spdifrx` instance.
-    pub fn new(
-        peri: impl Peripheral<P = T> + 'd,
-        _irq: impl interrupt::typelevel::Binding<T::GlobalInterrupt, GlobalInterruptHandler<T>> + 'd,
+    pub fn new<D>(
+        peri: Peri<'d, T>,
+        irq: impl interrupt::typelevel::Binding<T::GlobalInterrupt, GlobalInterruptHandler<T>>
+        + interrupt::typelevel::Binding<D::Interrupt, crate::dma::InterruptHandler<D>>
+        + 'd,
         config: Config,
-        spdifrx_in: impl Peripheral<P = impl InPin<T>> + 'd,
-        data_dma: impl Peripheral<P = impl Channel + Dma<T>> + 'd,
+        spdifrx_in: Peri<'d, impl InPin<T>>,
+        data_dma: Peri<'d, D>,
         data_dma_buf: &'d mut [u32],
-    ) -> Self {
+    ) -> Self
+    where
+        D: Dma<T>,
+    {
         let (spdifrx_in, input_sel) = new_spdifrx_pin!(spdifrx_in, AfType::input(Pull::None));
         Self::setup(config, input_sel);
 
-        into_ref!(peri, data_dma);
-
         let regs = T::info().regs;
         let dr_request = data_dma.request();
-        let dr_ring_buffer =
-            unsafe { ReadableRingBuffer::new(data_dma, dr_request, dr_address(regs), data_dma_buf, Self::dma_opts()) };
+        let dr_ring_buffer = unsafe {
+            ReadableRingBuffer::new(
+                Channel::new(data_dma, irq),
+                dr_request,
+                dr_address(regs),
+                data_dma_buf,
+                Self::dma_opts(),
+            )
+        };
 
         Self {
             _peri: peri,
-            spdifrx_in,
+            _spdifrx_in: spdifrx_in,
             data_ring_buffer: dr_ring_buffer,
         }
     }
@@ -226,7 +231,7 @@ impl<'d, T: Instance> Spdifrx<'d, T> {
         };
 
         for sample in data.as_mut() {
-            if (*sample & (0x0002_u32)) == 0x0001 {
+            if (*sample & (0x0002_u32)) != 0 {
                 // Discard invalid samples, setting them to mute level.
                 *sample = 0;
             } else {
@@ -239,11 +244,9 @@ impl<'d, T: Instance> Spdifrx<'d, T> {
     }
 }
 
-#[cfg(not(gpdma))]
 impl<'d, T: Instance> Drop for Spdifrx<'d, T> {
     fn drop(&mut self) {
         T::info().regs.cr().modify(|cr| cr.set_spdifen(0x00));
-        self.spdifrx_in.as_ref().map(|x| x.set_as_disconnected());
     }
 }
 
@@ -281,7 +284,7 @@ dma_trait!(Dma, Instance);
 
 /// Global interrupt handler.
 pub struct GlobalInterruptHandler<T: Instance> {
-    _phantom: PhantomData<T>,
+    _marker: PhantomData<T>,
 }
 
 impl<T: Instance> interrupt::typelevel::Handler<T::GlobalInterrupt> for GlobalInterruptHandler<T> {

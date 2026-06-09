@@ -5,13 +5,13 @@ use core::future;
 use core::marker::PhantomData;
 use core::task::Poll;
 
-use embassy_hal_internal::{into_ref, PeripheralRef};
+use embassy_hal_internal::{Peri, PeripheralType};
 use embassy_sync::waitqueue::AtomicWaker;
 use pac::i2c;
 
 use crate::gpio::AnyPin;
 use crate::interrupt::typelevel::{Binding, Interrupt};
-use crate::{interrupt, pac, peripherals, Peripheral};
+use crate::{interrupt, pac, peripherals};
 
 /// I2C error abort reason
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -64,18 +64,31 @@ pub enum ConfigError {
 pub struct Config {
     /// Frequency.
     pub frequency: u32,
+    /// Enable internal pullup on SDA.
+    ///
+    /// Using external pullup resistors is recommended for I2C. If you do
+    /// have external pullups you should not enable this.
+    pub sda_pullup: bool,
+    /// Enable internal pullup on SCL.
+    ///
+    /// Using external pullup resistors is recommended for I2C. If you do
+    /// have external pullups you should not enable this.
+    pub scl_pullup: bool,
 }
-
 impl Default for Config {
     fn default() -> Self {
-        Self { frequency: 100_000 }
+        Self {
+            frequency: 100_000,
+            sda_pullup: true,
+            scl_pullup: true,
+        }
     }
 }
-
 /// Size of I2C FIFO.
 pub const FIFO_SIZE: u8 = 16;
 
 /// I2C driver.
+#[derive(Debug)]
 pub struct I2c<'d, T: Instance, M: Mode> {
     phantom: PhantomData<(&'d mut T, M)>,
 }
@@ -83,28 +96,25 @@ pub struct I2c<'d, T: Instance, M: Mode> {
 impl<'d, T: Instance> I2c<'d, T, Blocking> {
     /// Create a new driver instance in blocking mode.
     pub fn new_blocking(
-        peri: impl Peripheral<P = T> + 'd,
-        scl: impl Peripheral<P = impl SclPin<T>> + 'd,
-        sda: impl Peripheral<P = impl SdaPin<T>> + 'd,
+        peri: Peri<'d, T>,
+        scl: Peri<'d, impl SclPin<T>>,
+        sda: Peri<'d, impl SdaPin<T>>,
         config: Config,
     ) -> Self {
-        into_ref!(scl, sda);
-        Self::new_inner(peri, scl.map_into(), sda.map_into(), config)
+        Self::new_inner(peri, scl.into(), sda.into(), config)
     }
 }
 
 impl<'d, T: Instance> I2c<'d, T, Async> {
     /// Create a new driver instance in async mode.
     pub fn new_async(
-        peri: impl Peripheral<P = T> + 'd,
-        scl: impl Peripheral<P = impl SclPin<T>> + 'd,
-        sda: impl Peripheral<P = impl SdaPin<T>> + 'd,
+        peri: Peri<'d, T>,
+        scl: Peri<'d, impl SclPin<T>>,
+        sda: Peri<'d, impl SdaPin<T>>,
         _irq: impl Binding<T::Interrupt, InterruptHandler<T>>,
         config: Config,
     ) -> Self {
-        into_ref!(scl, sda);
-
-        let i2c = Self::new_inner(peri, scl.map_into(), sda.map_into(), config);
+        let i2c = Self::new_inner(peri, scl.into(), sda.into(), config);
 
         let r = T::regs();
 
@@ -117,17 +127,19 @@ impl<'d, T: Instance> I2c<'d, T, Async> {
     }
 
     /// Calls `f` to check if we are ready or not.
-    /// If not, `g` is called once the waker is set (to eg enable the required interrupts).
+    /// If not, `g` is called once(to eg enable the required interrupts).
+    /// The waker will always be registered prior to calling `f`.
     async fn wait_on<F, U, G>(&mut self, mut f: F, mut g: G) -> U
     where
         F: FnMut(&mut Self) -> Poll<U>,
         G: FnMut(&mut Self),
     {
         future::poll_fn(|cx| {
+            // Register prior to checking the condition
+            T::waker().register(cx.waker());
             let r = f(self);
 
             if r.is_pending() {
-                T::waker().register(cx.waker());
                 g(self);
             }
             r
@@ -359,7 +371,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
     }
 }
 
-pub(crate) fn set_up_i2c_pin<P, T>(pin: &P)
+pub(crate) fn set_up_i2c_pin<P, T>(pin: &P, pullup: bool)
 where
     P: core::ops::Deref<Target = T>,
     T: crate::gpio::Pin,
@@ -372,27 +384,20 @@ where
         w.set_slewfast(false);
         w.set_ie(true);
         w.set_od(false);
-        w.set_pue(true);
+        w.set_pue(pullup);
         w.set_pde(false);
     });
 }
 
 impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
-    fn new_inner(
-        _peri: impl Peripheral<P = T> + 'd,
-        scl: PeripheralRef<'d, AnyPin>,
-        sda: PeripheralRef<'d, AnyPin>,
-        config: Config,
-    ) -> Self {
-        into_ref!(_peri);
-
+    fn new_inner(_peri: Peri<'d, T>, scl: Peri<'d, AnyPin>, sda: Peri<'d, AnyPin>, config: Config) -> Self {
         let reset = T::reset();
         crate::reset::reset(reset);
         crate::reset::unreset_wait(reset);
 
         // Configure SCL & SDA pins
-        set_up_i2c_pin(&scl);
-        set_up_i2c_pin(&sda);
+        set_up_i2c_pin(&scl, config.scl_pullup);
+        set_up_i2c_pin(&sda, config.sda_pullup);
 
         let mut me = Self { phantom: PhantomData };
 
@@ -469,12 +474,15 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
     }
 
     fn setup(addr: u16) -> Result<(), Error> {
-        if addr >= 0x80 {
+        if addr >= 0x400 {
             return Err(Error::AddressOutOfRange(addr));
         }
 
+        let ten_bit = addr > 0x7F;
+
         let p = T::regs();
         p.ic_enable().write(|w| w.set_enable(false));
+        p.ic_con().modify(|w| w.set_ic_10bitaddr_master(ten_bit));
         p.ic_tar().write(|w| w.set_ic_tar(addr));
         p.ic_enable().write(|w| w.set_enable(true));
         Ok(())
@@ -583,7 +591,7 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
 
                 while !p.ic_raw_intr_stat().read().stop_det() {}
 
-                p.ic_clr_stop_det().read().clr_stop_det();
+                p.ic_clr_stop_det().read();
             }
 
             // Note the hardware issues a STOP automatically on an abort
@@ -689,22 +697,25 @@ impl<'d, T: Instance, M: Mode> embedded_hal_1::i2c::ErrorType for I2c<'d, T, M> 
     type Error = Error;
 }
 
-impl<'d, T: Instance, M: Mode> embedded_hal_1::i2c::I2c for I2c<'d, T, M> {
-    fn read(&mut self, address: u8, read: &mut [u8]) -> Result<(), Self::Error> {
+impl<'d, T: Instance, M: Mode, A> embedded_hal_1::i2c::I2c<A> for I2c<'d, T, M>
+where
+    A: embedded_hal_1::i2c::AddressMode + Into<u16> + 'static,
+{
+    fn read(&mut self, address: A, read: &mut [u8]) -> Result<(), Self::Error> {
         self.blocking_read(address, read)
     }
 
-    fn write(&mut self, address: u8, write: &[u8]) -> Result<(), Self::Error> {
+    fn write(&mut self, address: A, write: &[u8]) -> Result<(), Self::Error> {
         self.blocking_write(address, write)
     }
 
-    fn write_read(&mut self, address: u8, write: &[u8], read: &mut [u8]) -> Result<(), Self::Error> {
+    fn write_read(&mut self, address: A, write: &[u8], read: &mut [u8]) -> Result<(), Self::Error> {
         self.blocking_write_read(address, write, read)
     }
 
     fn transaction(
         &mut self,
-        address: u8,
+        address: A,
         operations: &mut [embedded_hal_1::i2c::Operation<'_>],
     ) -> Result<(), Self::Error> {
         Self::setup(address.into())?;
@@ -804,7 +815,7 @@ impl_mode!(Async);
 
 /// I2C instance.
 #[allow(private_bounds)]
-pub trait Instance: SealedInstance {
+pub trait Instance: SealedInstance + PeripheralType {
     /// Interrupt for this peripheral.
     type Interrupt: interrupt::typelevel::Interrupt;
 }

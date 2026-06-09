@@ -1,4 +1,4 @@
-//! This example shows how to use the PIO module in the RP2040 to implement a stepper motor driver
+//! This example shows how to use the PIO module in the RP235x to implement a stepper motor driver
 //! for a 5-wire stepper such as the 28BYJ-48. You can halt an ongoing rotation by dropping the future.
 
 #![no_std]
@@ -10,7 +10,7 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::pio_programs::stepper::{PioStepper, PioStepperProgram};
-use embassy_time::{with_timeout, Duration, Timer};
+use embassy_time::{Duration, Timer, with_timeout};
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {

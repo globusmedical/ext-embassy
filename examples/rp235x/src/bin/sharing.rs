@@ -21,17 +21,16 @@ use defmt::info;
 use embassy_executor::{Executor, InterruptExecutor};
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::interrupt::{InterruptExt, Priority};
-use embassy_rp::peripherals::UART0;
+use embassy_rp::peripherals::{DMA_CH0, UART0};
 use embassy_rp::uart::{self, InterruptHandler, UartTx};
-use embassy_rp::{bind_interrupts, interrupt};
+use embassy_rp::{bind_interrupts, dma, interrupt};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::{blocking_mutex, mutex};
 use embassy_time::{Duration, Ticker};
-use rand::RngCore;
 use static_cell::{ConstStaticCell, StaticCell};
 use {defmt_rtt as _, panic_probe as _};
 
-type UartAsyncMutex = mutex::Mutex<CriticalSectionRawMutex, UartTx<'static, UART0, uart::Async>>;
+type UartAsyncMutex = mutex::Mutex<CriticalSectionRawMutex, UartTx<'static, uart::Async>>;
 
 struct MyType {
     inner: u32,
@@ -49,11 +48,12 @@ static MUTEX_BLOCKING: blocking_mutex::Mutex<CriticalSectionRawMutex, RefCell<My
 
 bind_interrupts!(struct Irqs {
     UART0_IRQ => InterruptHandler<UART0>;
+    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>;
 });
 
 #[interrupt]
 unsafe fn SWI_IRQ_0() {
-    EXECUTOR_HI.on_interrupt()
+    unsafe { EXECUTOR_HI.on_interrupt() }
 }
 
 #[entry]
@@ -61,7 +61,7 @@ fn main() -> ! {
     let p = embassy_rp::init(Default::default());
     info!("Here we go!");
 
-    let uart = UartTx::new(p.UART0, p.PIN_0, p.DMA_CH0, uart::Config::default());
+    let uart = UartTx::new(p.UART0, p.PIN_0, p.DMA_CH0, Irqs, uart::Config::default());
     // Use the async Mutex for sharing async things (built-in interior mutability)
     static UART: StaticCell<UartAsyncMutex> = StaticCell::new();
     let uart = UART.init(mutex::Mutex::new(uart));
@@ -69,7 +69,7 @@ fn main() -> ! {
     // High-priority executor: runs in interrupt mode
     interrupt::SWI_IRQ_0.set_priority(Priority::P3);
     let spawner = EXECUTOR_HI.start(interrupt::SWI_IRQ_0);
-    spawner.must_spawn(task_a(uart));
+    spawner.spawn(task_a(uart).unwrap());
 
     // Low priority executor: runs in thread mode
     let executor = EXECUTOR_LOW.init(Executor::new());
@@ -84,8 +84,8 @@ fn main() -> ! {
         static REF_CELL: ConstStaticCell<RefCell<MyType>> = ConstStaticCell::new(RefCell::new(MyType { inner: 0 }));
         let ref_cell = REF_CELL.take();
 
-        spawner.must_spawn(task_b(uart, cell, ref_cell));
-        spawner.must_spawn(task_c(cell, ref_cell));
+        spawner.spawn(task_b(uart, cell, ref_cell).unwrap());
+        spawner.spawn(task_c(cell, ref_cell).unwrap());
     });
 }
 

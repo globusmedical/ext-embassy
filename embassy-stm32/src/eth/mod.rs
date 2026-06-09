@@ -5,15 +5,18 @@
 #[cfg_attr(eth_v2, path = "v2/mod.rs")]
 mod _version;
 mod generic_phy;
+mod sma;
 
 use core::mem::MaybeUninit;
 use core::task::Context;
 
+use embassy_hal_internal::PeripheralType;
 use embassy_net_driver::{Capabilities, HardwareAddress, LinkState};
 use embassy_sync::waitqueue::AtomicWaker;
 
 pub use self::_version::{InterruptHandler, *};
 pub use self::generic_phy::*;
+pub use self::sma::{Instance as SmaInstance, Sma, StationManagement};
 use crate::rcc::RccPeripheral;
 
 #[allow(unused)]
@@ -108,11 +111,11 @@ impl<'d, T: Instance, P: Phy> embassy_net_driver::Driver for Ethernet<'d, T, P> 
     }
 
     fn link_state(&mut self, cx: &mut Context) -> LinkState {
-        if self.phy.poll_link(&mut self.station_management, cx) {
-            LinkState::Up
-        } else {
-            LinkState::Down
+        if let Some(link_state) = self.phy.poll_link(cx) {
+            self.link_state = if link_state { LinkState::Up } else { LinkState::Down };
         }
+
+        self.link_state
     }
 
     fn hardware_address(&self) -> HardwareAddress {
@@ -156,32 +159,17 @@ impl<'a, 'd> embassy_net_driver::TxToken for TxToken<'a, 'd> {
     }
 }
 
-/// Station Management Interface (SMI) on an ethernet PHY
-pub trait StationManagement {
-    /// Read a register over SMI.
-    fn smi_read(&mut self, phy_addr: u8, reg: u8) -> u16;
-    /// Write a register over SMI.
-    fn smi_write(&mut self, phy_addr: u8, reg: u8, val: u16);
-}
-
 /// Trait for an Ethernet PHY
 pub trait Phy {
     /// Reset PHY and wait for it to come out of reset.
-    fn phy_reset<S: StationManagement>(&mut self, sm: &mut S);
+    fn phy_reset(&mut self);
     /// PHY initialisation.
-    fn phy_init<S: StationManagement>(&mut self, sm: &mut S);
+    fn phy_init(&mut self);
     /// Poll link to see if it is up and FD with 100Mbps
-    fn poll_link<S: StationManagement>(&mut self, sm: &mut S, cx: &mut Context) -> bool;
+    fn poll_link(&mut self, cx: &mut Context) -> Option<bool>;
 }
 
 impl<'d, T: Instance, P: Phy> Ethernet<'d, T, P> {
-    /// Directly expose the SMI interface used by the Ethernet driver.
-    ///
-    /// This can be used to for example configure special PHY registers for compliance testing.
-    pub fn station_management(&mut self) -> &mut impl StationManagement {
-        &mut self.station_management
-    }
-
     /// Access the user-supplied `Phy`.
     pub fn phy(&self) -> &P {
         &self.phy
@@ -199,7 +187,7 @@ trait SealedInstance {
 
 /// Ethernet instance.
 #[allow(private_bounds)]
-pub trait Instance: SealedInstance + RccPeripheral + Send + 'static {}
+pub trait Instance: SealedInstance + PeripheralType + RccPeripheral + Send + 'static {}
 
 impl SealedInstance for crate::peripherals::ETH {
     fn regs() -> crate::pac::eth::Eth {
@@ -208,19 +196,19 @@ impl SealedInstance for crate::peripherals::ETH {
 }
 impl Instance for crate::peripherals::ETH {}
 
-pin_trait!(RXClkPin, Instance);
-pin_trait!(TXClkPin, Instance);
-pin_trait!(RefClkPin, Instance);
-pin_trait!(MDIOPin, Instance);
-pin_trait!(MDCPin, Instance);
-pin_trait!(RXDVPin, Instance);
-pin_trait!(CRSPin, Instance);
-pin_trait!(RXD0Pin, Instance);
-pin_trait!(RXD1Pin, Instance);
-pin_trait!(RXD2Pin, Instance);
-pin_trait!(RXD3Pin, Instance);
-pin_trait!(TXD0Pin, Instance);
-pin_trait!(TXD1Pin, Instance);
-pin_trait!(TXD2Pin, Instance);
-pin_trait!(TXD3Pin, Instance);
-pin_trait!(TXEnPin, Instance);
+pin_trait!(RXClkPin, Instance, @A);
+pin_trait!(TXClkPin, Instance, @A);
+pin_trait!(RefClkPin, Instance, @A);
+pin_trait!(MDIOPin, sma::Instance, @A);
+pin_trait!(MDCPin, sma::Instance, @A);
+pin_trait!(RXDVPin, Instance, @A);
+pin_trait!(CRSPin, Instance, @A);
+pin_trait!(RXD0Pin, Instance, @A);
+pin_trait!(RXD1Pin, Instance, @A);
+pin_trait!(RXD2Pin, Instance, @A);
+pin_trait!(RXD3Pin, Instance, @A);
+pin_trait!(TXD0Pin, Instance, @A);
+pin_trait!(TXD1Pin, Instance, @A);
+pin_trait!(TXD2Pin, Instance, @A);
+pin_trait!(TXD3Pin, Instance, @A);
+pin_trait!(TXEnPin, Instance, @A);

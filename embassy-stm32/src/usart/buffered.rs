@@ -1,28 +1,28 @@
 use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::slice;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use core::task::Poll;
 
 use embassy_embedded_hal::SetConfig;
+use embassy_hal_internal::Peri;
 use embassy_hal_internal::atomic_ring_buffer::RingBuffer;
-use embassy_hal_internal::{Peripheral, PeripheralRef};
 use embassy_sync::waitqueue::AtomicWaker;
 
 #[cfg(not(any(usart_v1, usart_v2)))]
 use super::DePin;
 use super::{
+    Config, ConfigError, CtsPin, Duplex, Error, HalfDuplexReadback, Info, Instance, Regs, RtsPin, RxPin, TxPin,
     clear_interrupt_flags, configure, half_duplex_set_rx_tx_before_write, rdr, reconfigure, send_break, set_baudrate,
-    sr, tdr, Config, ConfigError, CtsPin, Duplex, Error, HalfDuplexConfig, HalfDuplexReadback, Info, Instance, Regs,
-    RtsPin, RxPin, TxPin,
+    sr, tdr,
 };
-use crate::gpio::{AfType, AnyPin, OutputType, Pull, SealedPin as _, Speed};
+use crate::gpio::{AfType, Flex, Pull};
 use crate::interrupt::{self, InterruptExt};
 use crate::time::Hertz;
 
 /// Interrupt handler.
 pub struct InterruptHandler<T: Instance> {
-    _phantom: PhantomData<T>,
+    _marker: PhantomData<T>,
 }
 
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
@@ -32,6 +32,10 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
 }
 
 unsafe fn on_interrupt(r: Regs, state: &'static State) {
+    if state.tx_rx_refcount.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+
     // RX
     let sr_val = sr(r).read();
     // On v1 & v2, reading DR clears the rxne, error and idle interrupt
@@ -56,20 +60,35 @@ unsafe fn on_interrupt(r: Regs, state: &'static State) {
     if sr_val.ore() {
         warn!("Overrun error");
     }
+
+    // RX
     if sr_val.rxne() {
         let mut rx_writer = state.rx_buf.writer();
-        let buf = rx_writer.push_slice();
-        if !buf.is_empty() {
-            if let Some(byte) = dr {
-                buf[0] = byte;
-                rx_writer.push_done(1);
+        {
+            let mut rx_iter = rx_writer.iter();
+            if let Some(data) = dr
+                && let Some(byte) = rx_iter.next()
+            {
+                *byte = data;
             }
-        } else {
-            // FIXME: Should we disable any further RX interrupts when the buffer becomes full.
+
+            #[cfg(usart_v4)]
+            while sr(r).read().rxne()
+                && let Some(byte) = rx_iter.next()
+            {
+                *byte = rdr(r).read_volatile();
+            }
         }
 
-        if !state.rx_buf.is_empty() {
-            state.rx_waker.wake();
+        let eager = state.eager_reads.load(Ordering::Relaxed);
+        if eager > 0 {
+            if state.rx_buf.available() >= eager {
+                state.rx_waker.wake();
+            }
+        } else {
+            if state.rx_buf.is_half_full() {
+                state.rx_waker.wake();
+            }
         }
     }
 
@@ -80,13 +99,15 @@ unsafe fn on_interrupt(r: Regs, state: &'static State) {
     // With `usart_v4` hardware FIFO is enabled and Transmission complete (TC)
     // indicates that all bytes are pushed out from the FIFO.
     // For other usart variants it shows that last byte from the buffer was just sent.
-    if sr_val.tc() {
+    if sr_val.tc() && r.cr1().read().tcie() {
         // For others it is cleared above with `clear_interrupt_flags`.
         #[cfg(any(usart_v1, usart_v2))]
         sr(r).modify(|w| w.set_tc(false));
 
         r.cr1().modify(|w| {
             w.set_tcie(false);
+            // Reenable receiver for half-duplex if it was disabled
+            w.set_re(true);
         });
 
         state.tx_done.store(true, Ordering::Release);
@@ -96,27 +117,44 @@ unsafe fn on_interrupt(r: Regs, state: &'static State) {
     // TX
     if sr(r).read().txe() {
         let mut tx_reader = state.tx_buf.reader();
-        let buf = tx_reader.pop_slice();
-        if !buf.is_empty() {
+        let mut tx_iter = tx_reader.iter();
+        if tx_iter.size_hint().0 > 0 {
+            #[cfg(any(usart_v1, usart_v2, usart_v3))]
             r.cr1().modify(|w| {
                 w.set_txeie(true);
             });
 
-            // Enable transmission complete interrupt when last byte is going to be sent out.
-            if buf.len() == 1 {
-                r.cr1().modify(|w| {
-                    w.set_tcie(true);
-                });
-            }
+            #[cfg(usart_v4)]
+            r.cr3().modify(|w| {
+                w.set_txftie(true);
+            });
 
             half_duplex_set_rx_tx_before_write(&r, state.half_duplex_readback.load(Ordering::Relaxed));
 
-            tdr(r).write_volatile(buf[0].into());
-            tx_reader.pop_done(1);
-        } else {
+            while sr(r).read().txe()
+                && let Some(byte) = tx_iter.next()
+            {
+                // Enable transmission complete interrupt when last byte is going to be sent out.
+                if matches!(tx_iter.size_hint(), (0, Some(0))) {
+                    r.cr1().modify(|w| {
+                        w.set_tcie(true);
+                    });
+                }
+
+                tdr(r).write_volatile(byte.into());
+            }
+        }
+
+        if matches!(tx_iter.size_hint(), (0, Some(0))) {
             // Disable interrupt until we have something to transmit again.
+            #[cfg(any(usart_v1, usart_v2, usart_v3))]
             r.cr1().modify(|w| {
                 w.set_txeie(false);
+            });
+
+            #[cfg(usart_v4)]
+            r.cr3().modify(|w| {
+                w.set_txftie(false);
             });
         }
     }
@@ -130,6 +168,7 @@ pub(super) struct State {
     tx_done: AtomicBool,
     tx_rx_refcount: AtomicU8,
     half_duplex_readback: AtomicBool,
+    eager_reads: AtomicUsize,
 }
 
 impl State {
@@ -142,6 +181,7 @@ impl State {
             tx_done: AtomicBool::new(true),
             tx_rx_refcount: AtomicU8::new(0),
             half_duplex_readback: AtomicBool::new(false),
+            eager_reads: AtomicUsize::new(0),
         }
     }
 }
@@ -159,9 +199,9 @@ pub struct BufferedUartTx<'d> {
     info: &'static Info,
     state: &'static State,
     kernel_clock: Hertz,
-    tx: Option<PeripheralRef<'d, AnyPin>>,
-    cts: Option<PeripheralRef<'d, AnyPin>>,
-    de: Option<PeripheralRef<'d, AnyPin>>,
+    tx: Option<Flex<'d>>,
+    cts: Option<Flex<'d>>,
+    de: Option<Flex<'d>>,
     is_borrowed: bool,
 }
 
@@ -172,8 +212,8 @@ pub struct BufferedUartRx<'d> {
     info: &'static Info,
     state: &'static State,
     kernel_clock: Hertz,
-    rx: Option<PeripheralRef<'d, AnyPin>>,
-    rts: Option<PeripheralRef<'d, AnyPin>>,
+    rx: Option<Flex<'d>>,
+    rts: Option<Flex<'d>>,
     is_borrowed: bool,
 }
 
@@ -206,19 +246,19 @@ impl<'d> SetConfig for BufferedUartTx<'d> {
 
 impl<'d> BufferedUart<'d> {
     /// Create a new bidirectional buffered UART driver
-    pub fn new<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
-        _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
-        rx: impl Peripheral<P = impl RxPin<T>> + 'd,
-        tx: impl Peripheral<P = impl TxPin<T>> + 'd,
+    pub fn new<T: Instance, #[cfg(afio)] A>(
+        peri: Peri<'d, T>,
+        rx: Peri<'d, if_afio!(impl RxPin<T, A>)>,
+        tx: Peri<'d, if_afio!(impl TxPin<T, A>)>,
         tx_buffer: &'d mut [u8],
         rx_buffer: &'d mut [u8],
+        _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         config: Config,
     ) -> Result<Self, ConfigError> {
         Self::new_inner(
             peri,
-            new_pin!(rx, AfType::input(config.rx_pull)),
-            new_pin!(tx, AfType::output(OutputType::PushPull, Speed::Medium)),
+            new_pin!(rx, config.rx_af()),
+            new_pin!(tx, config.tx_af()),
             None,
             None,
             None,
@@ -229,23 +269,23 @@ impl<'d> BufferedUart<'d> {
     }
 
     /// Create a new bidirectional buffered UART driver with request-to-send and clear-to-send pins
-    pub fn new_with_rtscts<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
+    pub fn new_with_rtscts<T: Instance, #[cfg(afio)] A>(
+        peri: Peri<'d, T>,
+        rx: Peri<'d, if_afio!(impl RxPin<T, A>)>,
+        tx: Peri<'d, if_afio!(impl TxPin<T, A>)>,
+        rts: Peri<'d, if_afio!(impl RtsPin<T, A>)>,
+        cts: Peri<'d, if_afio!(impl CtsPin<T, A>)>,
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
-        rx: impl Peripheral<P = impl RxPin<T>> + 'd,
-        tx: impl Peripheral<P = impl TxPin<T>> + 'd,
-        rts: impl Peripheral<P = impl RtsPin<T>> + 'd,
-        cts: impl Peripheral<P = impl CtsPin<T>> + 'd,
         tx_buffer: &'d mut [u8],
         rx_buffer: &'d mut [u8],
         config: Config,
     ) -> Result<Self, ConfigError> {
         Self::new_inner(
             peri,
-            new_pin!(rx, AfType::input(Pull::None)),
-            new_pin!(tx, AfType::output(OutputType::PushPull, Speed::Medium)),
-            new_pin!(rts, AfType::output(OutputType::PushPull, Speed::Medium)),
-            new_pin!(cts, AfType::input(Pull::None)),
+            new_pin!(rx, config.rx_af()),
+            new_pin!(tx, config.tx_af()),
+            new_pin!(rts, config.rts_config.af_type()),
+            new_pin!(cts, AfType::input(config.cts_pull)),
             None,
             tx_buffer,
             rx_buffer,
@@ -254,20 +294,20 @@ impl<'d> BufferedUart<'d> {
     }
 
     /// Create a new bidirectional buffered UART driver with only the RTS pin as the DE pin
-    pub fn new_with_rts_as_de<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
+    pub fn new_with_rts_as_de<T: Instance, #[cfg(afio)] A>(
+        peri: Peri<'d, T>,
+        rx: Peri<'d, if_afio!(impl RxPin<T, A>)>,
+        tx: Peri<'d, if_afio!(impl TxPin<T, A>)>,
+        rts: Peri<'d, if_afio!(impl RtsPin<T, A>)>,
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
-        rx: impl Peripheral<P = impl RxPin<T>> + 'd,
-        tx: impl Peripheral<P = impl TxPin<T>> + 'd,
-        rts: impl Peripheral<P = impl RtsPin<T>> + 'd,
         tx_buffer: &'d mut [u8],
         rx_buffer: &'d mut [u8],
         config: Config,
     ) -> Result<Self, ConfigError> {
         Self::new_inner(
             peri,
-            new_pin!(rx, AfType::input(Pull::None)),
-            new_pin!(tx, AfType::output(OutputType::PushPull, Speed::Medium)),
+            new_pin!(rx, config.rx_af()),
+            new_pin!(tx, config.tx_af()),
             None,
             None,
             new_pin!(rts, AfType::input(Pull::None)), // RTS mapped used as DE
@@ -278,20 +318,20 @@ impl<'d> BufferedUart<'d> {
     }
 
     /// Create a new bidirectional buffered UART driver with only the request-to-send pin
-    pub fn new_with_rts<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
+    pub fn new_with_rts<T: Instance, #[cfg(afio)] A>(
+        peri: Peri<'d, T>,
+        rx: Peri<'d, if_afio!(impl RxPin<T, A>)>,
+        tx: Peri<'d, if_afio!(impl TxPin<T, A>)>,
+        rts: Peri<'d, if_afio!(impl RtsPin<T, A>)>,
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
-        rx: impl Peripheral<P = impl RxPin<T>> + 'd,
-        tx: impl Peripheral<P = impl TxPin<T>> + 'd,
-        rts: impl Peripheral<P = impl RtsPin<T>> + 'd,
         tx_buffer: &'d mut [u8],
         rx_buffer: &'d mut [u8],
         config: Config,
     ) -> Result<Self, ConfigError> {
         Self::new_inner(
             peri,
-            new_pin!(rx, AfType::input(Pull::None)),
-            new_pin!(tx, AfType::output(OutputType::PushPull, Speed::Medium)),
+            new_pin!(rx, config.rx_af()),
+            new_pin!(tx, config.tx_af()),
             new_pin!(rts, AfType::input(Pull::None)),
             None, // no CTS
             None, // no DE
@@ -303,23 +343,23 @@ impl<'d> BufferedUart<'d> {
 
     /// Create a new bidirectional buffered UART driver with a driver-enable pin
     #[cfg(not(any(usart_v1, usart_v2)))]
-    pub fn new_with_de<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
+    pub fn new_with_de<T: Instance, #[cfg(afio)] A>(
+        peri: Peri<'d, T>,
+        rx: Peri<'d, if_afio!(impl RxPin<T, A>)>,
+        tx: Peri<'d, if_afio!(impl TxPin<T, A>)>,
+        de: Peri<'d, if_afio!(impl DePin<T, A>)>,
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
-        rx: impl Peripheral<P = impl RxPin<T>> + 'd,
-        tx: impl Peripheral<P = impl TxPin<T>> + 'd,
-        de: impl Peripheral<P = impl DePin<T>> + 'd,
         tx_buffer: &'d mut [u8],
         rx_buffer: &'d mut [u8],
         config: Config,
     ) -> Result<Self, ConfigError> {
         Self::new_inner(
             peri,
-            new_pin!(rx, AfType::input(config.rx_pull)),
-            new_pin!(tx, AfType::output(OutputType::PushPull, Speed::Medium)),
+            new_pin!(rx, config.rx_af()),
+            new_pin!(tx, config.tx_af()),
             None,
             None,
-            new_pin!(de, AfType::output(OutputType::PushPull, Speed::Medium)),
+            new_pin!(de, config.de_config.af_type()),
             tx_buffer,
             rx_buffer,
             config,
@@ -338,15 +378,14 @@ impl<'d> BufferedUart<'d> {
     /// Apart from this, the communication protocol is similar to normal USART mode. Any conflict
     /// on the line must be managed by software (for instance by using a centralized arbiter).
     #[doc(alias("HDSEL"))]
-    pub fn new_half_duplex<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
-        tx: impl Peripheral<P = impl TxPin<T>> + 'd,
+    pub fn new_half_duplex<T: Instance, #[cfg(afio)] A>(
+        peri: Peri<'d, T>,
+        tx: Peri<'d, if_afio!(impl TxPin<T, A>)>,
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         tx_buffer: &'d mut [u8],
         rx_buffer: &'d mut [u8],
         mut config: Config,
         readback: HalfDuplexReadback,
-        half_duplex: HalfDuplexConfig,
     ) -> Result<Self, ConfigError> {
         #[cfg(not(any(usart_v1, usart_v2)))]
         {
@@ -357,7 +396,7 @@ impl<'d> BufferedUart<'d> {
         Self::new_inner(
             peri,
             None,
-            new_pin!(tx, half_duplex.af_type()),
+            new_pin!(tx, config.tx_af()),
             None,
             None,
             None,
@@ -378,22 +417,21 @@ impl<'d> BufferedUart<'d> {
     /// on the line must be managed by software (for instance by using a centralized arbiter).
     #[cfg(not(any(usart_v1, usart_v2)))]
     #[doc(alias("HDSEL"))]
-    pub fn new_half_duplex_on_rx<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
-        rx: impl Peripheral<P = impl RxPin<T>> + 'd,
+    pub fn new_half_duplex_on_rx<T: Instance, #[cfg(afio)] A>(
+        peri: Peri<'d, T>,
+        rx: Peri<'d, if_afio!(impl RxPin<T, A>)>,
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         tx_buffer: &'d mut [u8],
         rx_buffer: &'d mut [u8],
         mut config: Config,
         readback: HalfDuplexReadback,
-        half_duplex: HalfDuplexConfig,
     ) -> Result<Self, ConfigError> {
         config.swap_rx_tx = true;
         config.duplex = Duplex::Half(readback);
 
         Self::new_inner(
             peri,
-            new_pin!(rx, half_duplex.af_type()),
+            new_pin!(rx, config.rx_af()),
             None,
             None,
             None,
@@ -405,12 +443,12 @@ impl<'d> BufferedUart<'d> {
     }
 
     fn new_inner<T: Instance>(
-        _peri: impl Peripheral<P = T> + 'd,
-        rx: Option<PeripheralRef<'d, AnyPin>>,
-        tx: Option<PeripheralRef<'d, AnyPin>>,
-        rts: Option<PeripheralRef<'d, AnyPin>>,
-        cts: Option<PeripheralRef<'d, AnyPin>>,
-        de: Option<PeripheralRef<'d, AnyPin>>,
+        _peri: Peri<'d, T>,
+        rx: Option<Flex<'d>>,
+        tx: Option<Flex<'d>>,
+        rts: Option<Flex<'d>>,
+        cts: Option<Flex<'d>>,
+        de: Option<Flex<'d>>,
         tx_buffer: &'d mut [u8],
         rx_buffer: &'d mut [u8],
         config: Config,
@@ -419,6 +457,9 @@ impl<'d> BufferedUart<'d> {
         let state = T::buffered_state();
         let kernel_clock = T::frequency();
 
+        state
+            .eager_reads
+            .store(config.eager_reads.unwrap_or(0), Ordering::Relaxed);
         state.half_duplex_readback.store(
             config.duplex == Duplex::Half(HalfDuplexReadback::Readback),
             Ordering::Relaxed,
@@ -456,11 +497,16 @@ impl<'d> BufferedUart<'d> {
         let info = self.rx.info;
         let state = self.rx.state;
         state.tx_rx_refcount.store(2, Ordering::Relaxed);
+        state
+            .eager_reads
+            .store(config.eager_reads.unwrap_or(0), Ordering::Relaxed);
 
         info.rcc.enable_and_reset();
 
+        assert!(!tx_buffer.is_empty());
         let len = tx_buffer.len();
         unsafe { state.tx_buf.init(tx_buffer.as_mut_ptr(), len) };
+        assert!(!rx_buffer.is_empty());
         let len = rx_buffer.len();
         unsafe { state.rx_buf.init(rx_buffer.as_mut_ptr(), len) };
 
@@ -470,12 +516,28 @@ impl<'d> BufferedUart<'d> {
             #[cfg(not(any(usart_v1, usart_v2)))]
             w.set_dem(self.tx.de.is_some());
             w.set_hdsel(config.duplex.is_half());
+            #[cfg(usart_v4)]
+            w.set_rxftie(true);
+            #[cfg(usart_v4)]
+            w.set_txftcfg(config.tx_fifo_threshold);
+            #[cfg(usart_v4)]
+            w.set_rxftcfg(
+                match config.eager_reads {
+                    None | Some(0) => u8::MAX,
+                    Some(x) => x as u8,
+                }
+                .min(config.rx_fifo_threshold),
+            );
         });
         configure(info, self.rx.kernel_clock, &config, true, true)?;
 
         info.regs.cr1().modify(|w| {
             w.set_rxneie(true);
             w.set_idleie(true);
+            #[cfg(usart_v4)]
+            w.set_txeie(false);
+            #[cfg(usart_v4)]
+            w.set_rxneie(false);
 
             if config.duplex.is_half() {
                 // The te and re bits will be set by write, read and flush methods.
@@ -505,17 +567,17 @@ impl<'d> BufferedUart<'d> {
                 info: self.tx.info,
                 state: self.tx.state,
                 kernel_clock: self.tx.kernel_clock,
-                tx: self.tx.tx.as_mut().map(PeripheralRef::reborrow),
-                cts: self.tx.cts.as_mut().map(PeripheralRef::reborrow),
-                de: self.tx.de.as_mut().map(PeripheralRef::reborrow),
+                tx: self.tx.tx.as_mut().map(Flex::reborrow),
+                cts: self.tx.cts.as_mut().map(Flex::reborrow),
+                de: self.tx.de.as_mut().map(Flex::reborrow),
                 is_borrowed: true,
             },
             BufferedUartRx {
                 info: self.rx.info,
                 state: self.rx.state,
                 kernel_clock: self.rx.kernel_clock,
-                rx: self.rx.rx.as_mut().map(PeripheralRef::reborrow),
-                rts: self.rx.rts.as_mut().map(PeripheralRef::reborrow),
+                rx: self.rx.rx.as_mut().map(Flex::reborrow),
+                rts: self.rx.rts.as_mut().map(Flex::reborrow),
                 is_borrowed: true,
             },
         )
@@ -524,6 +586,11 @@ impl<'d> BufferedUart<'d> {
     /// Reconfigure the driver
     pub fn set_config(&mut self, config: &Config) -> Result<(), ConfigError> {
         reconfigure(self.rx.info, self.rx.kernel_clock, config)?;
+
+        self.rx
+            .state
+            .eager_reads
+            .store(config.eager_reads.unwrap_or(0), Ordering::Relaxed);
 
         self.rx.info.regs.cr1().modify(|w| {
             w.set_rxneie(true);
@@ -551,24 +618,30 @@ impl<'d> BufferedUartRx<'d> {
         poll_fn(move |cx| {
             let state = self.state;
             let mut rx_reader = unsafe { state.rx_buf.reader() };
-            let data = rx_reader.pop_slice();
+            let mut buf_len = 0;
+            let mut data = rx_reader.pop_slice();
 
-            if !data.is_empty() {
-                let len = data.len().min(buf.len());
-                buf[..len].copy_from_slice(&data[..len]);
+            while !data.is_empty() && buf_len < buf.len() {
+                let data_len = data.len().min(buf.len() - buf_len);
+                buf[buf_len..buf_len + data_len].copy_from_slice(&data[..data_len]);
+                buf_len += data_len;
 
                 let do_pend = state.rx_buf.is_full();
-                rx_reader.pop_done(len);
+                rx_reader.pop_done(data_len);
 
                 if do_pend {
                     self.info.interrupt.pend();
                 }
 
-                return Poll::Ready(Ok(len));
+                data = rx_reader.pop_slice();
             }
 
-            state.rx_waker.register(cx.waker());
-            Poll::Pending
+            if buf_len != 0 {
+                Poll::Ready(Ok(buf_len))
+            } else {
+                state.rx_waker.register(cx.waker());
+                Poll::Pending
+            }
         })
         .await
     }
@@ -577,21 +650,24 @@ impl<'d> BufferedUartRx<'d> {
         loop {
             let state = self.state;
             let mut rx_reader = unsafe { state.rx_buf.reader() };
-            let data = rx_reader.pop_slice();
+            let mut buf_len = 0;
+            let mut data = rx_reader.pop_slice();
 
-            if !data.is_empty() {
-                let len = data.len().min(buf.len());
-                buf[..len].copy_from_slice(&data[..len]);
+            while !data.is_empty() && buf_len < buf.len() {
+                let data_len = data.len().min(buf.len() - buf_len);
+                buf[buf_len..buf_len + data_len].copy_from_slice(&data[..data_len]);
+                buf_len += data_len;
 
                 let do_pend = state.rx_buf.is_full();
-                rx_reader.pop_done(len);
+                rx_reader.pop_done(data_len);
 
                 if do_pend {
                     self.info.interrupt.pend();
                 }
 
-                return Ok(len);
+                data = rx_reader.pop_slice();
             }
+            return Ok(buf_len);
         }
     }
 
@@ -631,6 +707,10 @@ impl<'d> BufferedUartRx<'d> {
     pub fn set_config(&mut self, config: &Config) -> Result<(), ConfigError> {
         reconfigure(self.info, self.kernel_clock, config)?;
 
+        self.state
+            .eager_reads
+            .store(config.eager_reads.unwrap_or(0), Ordering::Relaxed);
+
         self.info.regs.cr1().modify(|w| {
             w.set_rxneie(true);
             w.set_idleie(true);
@@ -653,22 +733,33 @@ impl<'d> BufferedUartTx<'d> {
 
             let empty = state.tx_buf.is_empty();
 
-            let mut tx_writer = unsafe { state.tx_buf.writer() };
-            let data = tx_writer.push_slice();
-            if data.is_empty() {
-                state.tx_waker.register(cx.waker());
+            if state.tx_buf.len() < buf.len() {
+                return Poll::Ready(Err(Error::BufferTooLong));
+            }
+
+            if state.tx_buf.len() - state.tx_buf.available() < buf.len() {
                 return Poll::Pending;
             }
 
-            let n = data.len().min(buf.len());
-            data[..n].copy_from_slice(&buf[..n]);
-            tx_writer.push_done(n);
+            let mut written: usize = 0;
+            let mut tx_writer = unsafe { state.tx_buf.writer() };
+            while written != buf.len() {
+                let data = tx_writer.push_slice();
+                if data.is_empty() {
+                    state.tx_waker.register(cx.waker());
+                    return Poll::Pending;
+                }
+                let n = data.len().min(buf.len() - written);
+                data[..n].copy_from_slice(&buf[written..written + n]);
+                written = written + n;
+                tx_writer.push_done(n);
+            }
 
             if empty {
                 self.info.interrupt.pend();
             }
 
-            Poll::Ready(Ok(n))
+            Poll::Ready(Ok(written))
         })
         .await
     }
@@ -690,28 +781,34 @@ impl<'d> BufferedUartTx<'d> {
     fn blocking_write(&self, buf: &[u8]) -> Result<usize, Error> {
         loop {
             let state = self.state;
+            state.tx_done.store(false, Ordering::Release);
+
             let empty = state.tx_buf.is_empty();
 
+            let mut written: usize = 0;
             let mut tx_writer = unsafe { state.tx_buf.writer() };
-            let data = tx_writer.push_slice();
-            if !data.is_empty() {
-                let n = data.len().min(buf.len());
-                data[..n].copy_from_slice(&buf[..n]);
-                tx_writer.push_done(n);
-
-                if empty {
-                    self.info.interrupt.pend();
+            while written != buf.len() {
+                let data = tx_writer.push_slice();
+                if !data.is_empty() {
+                    let n = data.len().min(buf.len() - written);
+                    data[..n].copy_from_slice(&buf[written..written + n]);
+                    written = written + n;
+                    tx_writer.push_done(n);
                 }
-
-                return Ok(n);
             }
+
+            if empty {
+                self.info.interrupt.pend();
+            }
+
+            return Ok(written);
         }
     }
 
     fn blocking_flush(&self) -> Result<(), Error> {
         loop {
             let state = self.state;
-            if state.tx_buf.is_empty() {
+            if state.tx_done.load(Ordering::Acquire) {
                 return Ok(());
             }
         }
@@ -754,8 +851,6 @@ impl<'d> Drop for BufferedUartRx<'d> {
                 }
             }
 
-            self.rx.as_ref().map(|x| x.set_as_disconnected());
-            self.rts.as_ref().map(|x| x.set_as_disconnected());
             drop_tx_rx(self.info, state);
         }
     }
@@ -774,10 +869,6 @@ impl<'d> Drop for BufferedUartTx<'d> {
                     self.info.interrupt.disable();
                 }
             }
-
-            self.tx.as_ref().map(|x| x.set_as_disconnected());
-            self.cts.as_ref().map(|x| x.set_as_disconnected());
-            self.de.as_ref().map(|x| x.set_as_disconnected());
             drop_tx_rx(self.info, state);
         }
     }

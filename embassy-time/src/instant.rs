@@ -1,7 +1,7 @@
 use core::fmt;
 use core::ops::{Add, AddAssign, Sub, SubAssign};
 
-use super::{Duration, GCD_1K, GCD_1M, TICK_HZ};
+use super::{Duration, GCD_1G, GCD_1K, GCD_1M, TICK_HZ};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -29,6 +29,13 @@ impl Instant {
         Self { ticks }
     }
 
+    /// Create an Instant from a nanosecond count since system boot.
+    pub const fn from_nanos(nanos: u64) -> Self {
+        Self {
+            ticks: nanos * (TICK_HZ / GCD_1G) / (1_000_000_000 / GCD_1G),
+        }
+    }
+
     /// Create an Instant from a microsecond count since system boot.
     pub const fn from_micros(micros: u64) -> Self {
         Self {
@@ -50,6 +57,48 @@ impl Instant {
         }
     }
 
+    /// Try to create an Instant from a nanosecond count since system boot.
+    /// Fails if the number of nanoseconds is too large.
+    pub const fn try_from_nanos(nanos: u64) -> Option<Self> {
+        let Some(value) = nanos.checked_mul(TICK_HZ / GCD_1G) else {
+            return None;
+        };
+        Some(Self {
+            ticks: value / (1_000_000_000 / GCD_1G),
+        })
+    }
+
+    /// Try to create an Instant from a microsecond count since system boot.
+    /// Fails if the number of microseconds is too large.
+    pub const fn try_from_micros(micros: u64) -> Option<Self> {
+        let Some(value) = micros.checked_mul(TICK_HZ / GCD_1M) else {
+            return None;
+        };
+        Some(Self {
+            ticks: value / (1_000_000 / GCD_1M),
+        })
+    }
+
+    /// Try to create an Instant from a millisecond count since system boot.
+    /// Fails if the number of milliseconds is too large.
+    pub const fn try_from_millis(millis: u64) -> Option<Self> {
+        let Some(value) = millis.checked_mul(TICK_HZ / GCD_1K) else {
+            return None;
+        };
+        Some(Self {
+            ticks: value / (1000 / GCD_1K),
+        })
+    }
+
+    /// Try to create an Instant from a second count since system boot.
+    /// Fails if the number of seconds is too large.
+    pub const fn try_from_secs(seconds: u64) -> Option<Self> {
+        let Some(ticks) = seconds.checked_mul(TICK_HZ) else {
+            return None;
+        };
+        Some(Self { ticks })
+    }
+
     /// Tick count since system boot.
     pub const fn as_ticks(&self) -> u64 {
         self.ticks
@@ -68,6 +117,11 @@ impl Instant {
     /// Microseconds since system boot.
     pub const fn as_micros(&self) -> u64 {
         self.ticks * (1_000_000 / GCD_1M) / (TICK_HZ / GCD_1M)
+    }
+
+    /// Nanoseconds since system boot.
+    pub const fn as_nanos(&self) -> u64 {
+        self.ticks * (1_000_000_000 / GCD_1G) / (TICK_HZ / GCD_1G)
     }
 
     /// Duration between this Instant and another Instant

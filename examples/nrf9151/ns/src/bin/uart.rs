@@ -14,10 +14,10 @@ bind_interrupts!(struct Irqs {
 async fn main(_spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
     let mut config = uarte::Config::default();
-    config.parity = uarte::Parity::EXCLUDED;
-    config.baudrate = uarte::Baudrate::BAUD115200;
+    config.parity = uarte::Parity::Excluded;
+    config.baudrate = uarte::Baudrate::Baud115200;
 
-    let mut uart = uarte::Uarte::new(p.SERIAL0, Irqs, p.P0_26, p.P0_27, config);
+    let mut uart = uarte::Uarte::new(p.SERIAL0, p.P0_26, p.P0_27, Irqs, config);
 
     info!("uarte initialized!");
 

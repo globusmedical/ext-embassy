@@ -8,12 +8,14 @@ teleprobe_meta::target!(b"pimoroni-pico-plus-2");
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_rp::adc::{Adc, Channel, Config, InterruptHandler, Sample};
-use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output, Pull};
+use embassy_rp::peripherals::DMA_CH0;
+use embassy_rp::{bind_interrupts, dma};
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
     ADC_IRQ_FIFO => InterruptHandler;
+    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>;
 });
 
 #[embassy_executor::main]
@@ -22,6 +24,7 @@ async fn main(_spawner: Spawner) {
     let _power_reg_pwm_mode = Output::new(p.PIN_23, Level::High);
     let _wifi_off = Output::new(p.PIN_25, Level::High);
     let mut adc = Adc::new(p.ADC, Irqs, Config::default());
+    let mut dma_ch = dma::Channel::new(p.DMA_CH0, Irqs);
 
     #[cfg(any(feature = "rp2040", feature = "rp235xa"))]
     let (mut a, mut b, mut c, mut d) = (p.PIN_26, p.PIN_27, p.PIN_28, p.PIN_29);
@@ -30,12 +33,12 @@ async fn main(_spawner: Spawner) {
 
     {
         {
-            let mut p = Channel::new_pin(&mut a, Pull::Down);
+            let mut p = Channel::new_pin(a.reborrow(), Pull::Down);
             defmt::assert!(adc.blocking_read(&mut p).unwrap() < 0b01_0000_0000);
             defmt::assert!(adc.read(&mut p).await.unwrap() < 0b01_0000_0000);
         }
         {
-            let mut p = Channel::new_pin(&mut a, Pull::Up);
+            let mut p = Channel::new_pin(a.reborrow(), Pull::Up);
             defmt::assert!(adc.blocking_read(&mut p).unwrap() > 0b11_0000_0000);
             defmt::assert!(adc.read(&mut p).await.unwrap() > 0b11_0000_0000);
         }
@@ -43,21 +46,21 @@ async fn main(_spawner: Spawner) {
     // not bothering with async reads from now on
     {
         {
-            let mut p = Channel::new_pin(&mut b, Pull::Down);
+            let mut p = Channel::new_pin(b.reborrow(), Pull::Down);
             defmt::assert!(adc.blocking_read(&mut p).unwrap() < 0b01_0000_0000);
         }
         {
-            let mut p = Channel::new_pin(&mut b, Pull::Up);
+            let mut p = Channel::new_pin(b.reborrow(), Pull::Up);
             defmt::assert!(adc.blocking_read(&mut p).unwrap() > 0b11_0000_0000);
         }
     }
     {
         {
-            let mut p = Channel::new_pin(&mut c, Pull::Down);
+            let mut p = Channel::new_pin(c.reborrow(), Pull::Down);
             defmt::assert!(adc.blocking_read(&mut p).unwrap() < 0b01_0000_0000);
         }
         {
-            let mut p = Channel::new_pin(&mut c, Pull::Up);
+            let mut p = Channel::new_pin(c.reborrow(), Pull::Up);
             defmt::assert!(adc.blocking_read(&mut p).unwrap() > 0b11_0000_0000);
         }
     }
@@ -65,15 +68,15 @@ async fn main(_spawner: Spawner) {
         // gp29 is connected to vsys through a 200k/100k divider,
         // adding pulls should change the value
         let low = {
-            let mut p = Channel::new_pin(&mut d, Pull::Down);
+            let mut p = Channel::new_pin(d.reborrow(), Pull::Down);
             adc.blocking_read(&mut p).unwrap()
         };
         let none = {
-            let mut p = Channel::new_pin(&mut d, Pull::None);
+            let mut p = Channel::new_pin(d.reborrow(), Pull::None);
             adc.blocking_read(&mut p).unwrap()
         };
         let up = {
-            let mut p = Channel::new_pin(&mut d, Pull::Up);
+            let mut p = Channel::new_pin(d.reborrow(), Pull::Up);
             adc.blocking_read(&mut p).unwrap()
         };
         defmt::assert!(low < none);
@@ -81,7 +84,7 @@ async fn main(_spawner: Spawner) {
     }
     {
         let temp = convert_to_celsius(
-            adc.read(&mut Channel::new_temp_sensor(&mut p.ADC_TEMP_SENSOR))
+            adc.read(&mut Channel::new_temp_sensor(p.ADC_TEMP_SENSOR.reborrow()))
                 .await
                 .unwrap(),
         );
@@ -97,13 +100,23 @@ async fn main(_spawner: Spawner) {
         let mut low = [0u16; 16];
         let mut none = [0u8; 16];
         let mut up = [Sample::default(); 16];
-        adc.read_many(&mut Channel::new_pin(&mut d, Pull::Down), &mut low, 1, &mut p.DMA_CH0)
-            .await
-            .unwrap();
-        adc.read_many(&mut Channel::new_pin(&mut d, Pull::None), &mut none, 1, &mut p.DMA_CH0)
-            .await
-            .unwrap();
-        adc.read_many_raw(&mut Channel::new_pin(&mut d, Pull::Up), &mut up, 1, &mut p.DMA_CH0)
+        adc.read_many(
+            &mut Channel::new_pin(d.reborrow(), Pull::Down),
+            &mut low,
+            1,
+            &mut dma_ch,
+        )
+        .await
+        .unwrap();
+        adc.read_many(
+            &mut Channel::new_pin(d.reborrow(), Pull::None),
+            &mut none,
+            1,
+            &mut dma_ch,
+        )
+        .await
+        .unwrap();
+        adc.read_many_raw(&mut Channel::new_pin(d.reborrow(), Pull::Up), &mut up, 1, &mut dma_ch)
             .await;
         defmt::assert!(low.iter().zip(none.iter()).all(|(l, n)| *l >> 4 < *n as u16));
         defmt::assert!(up.iter().all(|s| s.good()));
@@ -112,10 +125,10 @@ async fn main(_spawner: Spawner) {
     {
         let mut temp = [0u16; 16];
         adc.read_many(
-            &mut Channel::new_temp_sensor(&mut p.ADC_TEMP_SENSOR),
+            &mut Channel::new_temp_sensor(p.ADC_TEMP_SENSOR.reborrow()),
             &mut temp,
             1,
-            &mut p.DMA_CH0,
+            &mut dma_ch,
         )
         .await
         .unwrap();
@@ -126,10 +139,10 @@ async fn main(_spawner: Spawner) {
     {
         let mut multi = [0u16; 2];
         let mut channels = [
-            Channel::new_pin(&mut a, Pull::Up),
-            Channel::new_temp_sensor(&mut p.ADC_TEMP_SENSOR),
+            Channel::new_pin(a.reborrow(), Pull::Up),
+            Channel::new_temp_sensor(p.ADC_TEMP_SENSOR.reborrow()),
         ];
-        adc.read_many_multichannel(&mut channels, &mut multi, 1, &mut p.DMA_CH0)
+        adc.read_many_multichannel(&mut channels, &mut multi, 1, &mut dma_ch)
             .await
             .unwrap();
         defmt::assert!(multi[0] > 3_000);

@@ -1,10 +1,9 @@
-use core::future::{poll_fn, Future};
-use core::pin::{pin, Pin};
+use core::future::{Future, poll_fn};
+use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use futures_util::future::{select, Either};
-use futures_util::stream::FusedStream;
-use futures_util::Stream;
+use futures_core::Stream;
+use futures_core::stream::FusedStream;
 
 use crate::{Duration, Instant};
 
@@ -17,11 +16,10 @@ pub struct TimeoutError;
 ///
 /// If the future completes before the timeout, its output is returned. Otherwise, on timeout,
 /// work on the future is stopped (`poll` is no longer called), the future is dropped and `Err(TimeoutError)` is returned.
-pub async fn with_timeout<F: Future>(timeout: Duration, fut: F) -> Result<F::Output, TimeoutError> {
-    let timeout_fut = Timer::after(timeout);
-    match select(pin!(fut), timeout_fut).await {
-        Either::Left((r, _)) => Ok(r),
-        Either::Right(_) => Err(TimeoutError),
+pub fn with_timeout<F: Future>(timeout: impl Into<Duration>, fut: F) -> TimeoutFuture<F> {
+    TimeoutFuture {
+        timer: Timer::after(timeout.into()),
+        fut,
     }
 }
 
@@ -29,16 +27,15 @@ pub async fn with_timeout<F: Future>(timeout: Duration, fut: F) -> Result<F::Out
 ///
 /// If the future completes before the deadline, its output is returned. Otherwise, on timeout,
 /// work on the future is stopped (`poll` is no longer called), the future is dropped and `Err(TimeoutError)` is returned.
-pub async fn with_deadline<F: Future>(at: Instant, fut: F) -> Result<F::Output, TimeoutError> {
-    let timeout_fut = Timer::at(at);
-    match select(pin!(fut), timeout_fut).await {
-        Either::Left((r, _)) => Ok(r),
-        Either::Right(_) => Err(TimeoutError),
+pub fn with_deadline<F: Future>(at: Instant, fut: F) -> TimeoutFuture<F> {
+    TimeoutFuture {
+        timer: Timer::at(at),
+        fut,
     }
 }
 
 /// Provides functions to run a given future with a timeout or a deadline.
-pub trait WithTimeout {
+pub trait WithTimeout: Sized {
     /// Output type of the future.
     type Output;
 
@@ -46,29 +43,59 @@ pub trait WithTimeout {
     ///
     /// If the future completes before the timeout, its output is returned. Otherwise, on timeout,
     /// work on the future is stopped (`poll` is no longer called), the future is dropped and `Err(TimeoutError)` is returned.
-    async fn with_timeout(self, timeout: Duration) -> Result<Self::Output, TimeoutError>;
+    fn with_timeout(self, timeout: impl Into<Duration>) -> TimeoutFuture<Self>;
 
     /// Runs a given future with a deadline time.
     ///
     /// If the future completes before the deadline, its output is returned. Otherwise, on timeout,
     /// work on the future is stopped (`poll` is no longer called), the future is dropped and `Err(TimeoutError)` is returned.
-    async fn with_deadline(self, at: Instant) -> Result<Self::Output, TimeoutError>;
+    fn with_deadline(self, at: Instant) -> TimeoutFuture<Self>;
 }
 
 impl<F: Future> WithTimeout for F {
     type Output = F::Output;
 
-    async fn with_timeout(self, timeout: Duration) -> Result<Self::Output, TimeoutError> {
-        with_timeout(timeout, self).await
+    fn with_timeout(self, timeout: impl Into<Duration>) -> TimeoutFuture<Self> {
+        with_timeout(timeout.into(), self)
     }
 
-    async fn with_deadline(self, at: Instant) -> Result<Self::Output, TimeoutError> {
-        with_deadline(at, self).await
+    fn with_deadline(self, at: Instant) -> TimeoutFuture<Self> {
+        with_deadline(at, self)
+    }
+}
+
+/// Future for the [`with_timeout`] and [`with_deadline`] functions.
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+#[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct TimeoutFuture<F> {
+    timer: Timer,
+    fut: F,
+}
+
+impl<F: Unpin> Unpin for TimeoutFuture<F> {}
+
+impl<F: Future> Future for TimeoutFuture<F> {
+    type Output = Result<F::Output, TimeoutError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
+        let timer = unsafe { Pin::new_unchecked(&mut this.timer) };
+        if let Poll::Ready(x) = fut.poll(cx) {
+            return Poll::Ready(Ok(x));
+        }
+        if let Poll::Ready(_) = timer.poll(cx) {
+            return Poll::Ready(Err(TimeoutError));
+        }
+        Poll::Pending
     }
 }
 
 /// A future that completes at a specified [Instant](struct.Instant.html).
 #[must_use = "futures do nothing unless you `.await` or poll them"]
+#[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Timer {
     expires_at: Instant,
     yielded_once: bool,
@@ -76,6 +103,7 @@ pub struct Timer {
 
 impl Timer {
     /// Expire at specified [Instant](struct.Instant.html)
+    /// Will expire immediately if the Instant is in the past.
     pub fn at(expires_at: Instant) -> Self {
         Self {
             expires_at,
@@ -85,6 +113,15 @@ impl Timer {
 
     /// Expire after specified [Duration](struct.Duration.html).
     /// This can be used as a `sleep` abstraction.
+    ///
+    /// Note: You must ensure that Instant::now() when added to the intended
+    /// sleep duration does not overflow the u64 tick counter or a panic will occur.
+    ///
+    /// For example Timer::after(Duration::MAX) will always panic
+    /// and must be avoided.
+    ///
+    /// The same restriction applies to with_timeout() and the other
+    /// after_* functions.
     ///
     /// Example:
     /// ``` no_run
@@ -96,9 +133,9 @@ impl Timer {
     ///     Timer::after(Duration::from_secs(1)).await;
     /// }
     /// ```
-    pub fn after(duration: Duration) -> Self {
+    pub fn after(duration: impl Into<Duration>) -> Self {
         Self {
-            expires_at: Instant::now() + duration,
+            expires_at: Instant::now() + duration.into(),
             yielded_once: false,
         }
     }
@@ -204,6 +241,8 @@ impl Future for Timer {
 /// ## Cancel safety
 /// It is safe to cancel waiting for the next tick,
 /// meaning no tick is lost if the Future is dropped.
+#[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Ticker {
     expires_at: Instant,
     duration: Duration,
@@ -211,7 +250,8 @@ pub struct Ticker {
 
 impl Ticker {
     /// Creates a new ticker that ticks at the specified duration interval.
-    pub fn every(duration: Duration) -> Self {
+    pub fn every(duration: impl Into<Duration>) -> Self {
+        let duration = duration.into();
         let expires_at = Instant::now() + duration;
         Self { expires_at, duration }
     }
@@ -223,15 +263,15 @@ impl Ticker {
     }
 
     /// Reset the ticker at the deadline.
-    /// If the deadline is in the past, the ticker will fire instantly.
+    /// If the deadline is in the past, the ticker will fire before the next scheduled tick.
     pub fn reset_at(&mut self, deadline: Instant) {
         self.expires_at = deadline + self.duration;
     }
 
     /// Resets the ticker, after the specified duration has passed.
     /// If the specified duration is zero, the next tick will be after the duration of the ticker.
-    pub fn reset_after(&mut self, after: Duration) {
-        self.expires_at = Instant::now() + after + self.duration;
+    pub fn reset_after(&mut self, after: impl Into<Duration>) {
+        self.expires_at = Instant::now() + after.into() + self.duration;
     }
 
     /// Waits for the next tick.
@@ -274,3 +314,10 @@ impl FusedStream for Ticker {
         false
     }
 }
+
+impl core::fmt::Display for TimeoutError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("TimeoutError")
+    }
+}
+impl core::error::Error for TimeoutError {}
