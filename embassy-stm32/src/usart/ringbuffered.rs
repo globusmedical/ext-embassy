@@ -200,10 +200,13 @@ impl<'d> RingBufferedUartRx<'d> {
     fn start_dma_or_check_errors(&mut self) -> Result<(), Error> {
         let r = self.info.regs;
 
-        check_idle_and_errors(r)?;
+        // Restart before reporting an error: with the DMA stopped, every byte that arrives
+        // sets the overrun flag again, so returning first would never restart reception.
+        let status = check_idle_and_errors(r);
         if !r.cr3().read().dmar() {
             self.start_uart();
         }
+        status?;
         Ok(())
     }
 
