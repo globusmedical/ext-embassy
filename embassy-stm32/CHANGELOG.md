@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## Unreleased - ReleaseDate
 
+USART:
+- feat: stm32/usart: `RingBufferedUartRx::set_stop_on_line_error(false)` keeps receiving through framing, noise, parity and receiver overrun errors and counts them in `line_errors()`, instead of stopping the DMA and dropping buffered bytes.
+
 CAN:
 - fix: stm32/can/fdcan: write `FilterType::Range` bounds in the correct order (`from`→SFID1/EFID1, `to`→SFID2/EFID2). The swapped order prevented normal multi-ID ranges from matching, breaking both accepting and rejecting range filters.
 

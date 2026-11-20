@@ -86,6 +86,36 @@ pub struct RingBufferedUartRx<'d> {
     _rx: Option<Flex<'d>>,
     _rts: Option<Flex<'d>>,
     ring_buf: ReadableRingBuffer<'d, u8>,
+    stop_on_line_error: bool,
+    line_errors: LineErrors,
+}
+
+/// Line errors counted while reception continued.
+///
+/// See [`RingBufferedUartRx::set_stop_on_line_error`]. The counts are cumulative and wrap.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct LineErrors {
+    /// Framing errors
+    pub framing: u32,
+    /// Noise errors
+    pub noise: u32,
+    /// Parity errors
+    pub parity: u32,
+    /// Receiver overruns: a byte arrived before the DMA took the previous one
+    pub overrun: u32,
+}
+
+impl LineErrors {
+    fn record(&mut self, error: Error) {
+        let count = match error {
+            Error::Framing => &mut self.framing,
+            Error::Noise => &mut self.noise,
+            Error::Parity => &mut self.parity,
+            _ => &mut self.overrun,
+        };
+        *count = count.wrapping_add(1);
+    }
 }
 
 impl<'d> SetConfig for RingBufferedUartRx<'d> {
@@ -131,6 +161,8 @@ impl<'d> UartRx<'d, Async> {
             _rx: rx,
             _rts: rts,
             ring_buf,
+            stop_on_line_error: true,
+            line_errors: LineErrors::default(),
         }
     }
 }
@@ -142,6 +174,31 @@ impl<'d> RingBufferedUartRx<'d> {
             .eager_reads
             .store(config.eager_reads.unwrap_or(0), Ordering::Relaxed);
         reconfigure(self.info, self.kernel_clock, config)
+    }
+
+    /// Choose whether a line error stops reception.
+    ///
+    /// By default a framing, noise, parity or receiver overrun error stops the DMA and
+    /// the read returns the error; the next read restarts reception with an empty
+    /// buffer, so bytes already received and bytes arriving before the restart are lost.
+    ///
+    /// With `false`, the driver clears the error, counts it in [`Self::line_errors`]
+    /// and keeps receiving. The DMA keeps running through a line error (`DDRE` is not
+    /// set), so the only byte affected is the one the error belongs to. Use this for a
+    /// protocol that validates its own frames, such as one with a CRC, on a line where
+    /// errors are expected, such as RS-485 during bus turnaround.
+    ///
+    /// A ring buffer overrun, where the reader fell behind the DMA, always stops
+    /// reception and returns [`Error::Overrun`].
+    pub fn set_stop_on_line_error(&mut self, stop: bool) {
+        self.stop_on_line_error = stop;
+    }
+
+    /// Line errors counted since creation while reception continued.
+    ///
+    /// Only counts errors while [`Self::set_stop_on_line_error`] is `false`.
+    pub fn line_errors(&self) -> LineErrors {
+        self.line_errors
     }
 
     /// Configure and start the DMA backed UART receiver
@@ -200,7 +257,14 @@ impl<'d> RingBufferedUartRx<'d> {
     fn start_dma_or_check_errors(&mut self) -> Result<(), Error> {
         let r = self.info.regs;
 
-        check_idle_and_errors(r)?;
+        let status = check_line_status(r);
+        if let Some(error) = status.error {
+            if self.stop_on_line_error {
+                return Err(error);
+            }
+            self.line_errors.record(error);
+        }
+        r.cr1().modify(|w| w.set_idleie(true));
         if !r.cr3().read().dmar() {
             self.start_uart();
         }
@@ -263,6 +327,9 @@ impl<'d> RingBufferedUartRx<'d> {
         loop {
             // Future which completes when idle line is detected
             let s = self.state;
+            let regs = self.info.regs;
+            let stop_on_line_error = self.stop_on_line_error;
+            let line_errors = &mut self.line_errors;
             let mut uart_init = false;
             let uart = poll_fn(|cx| {
                 s.rx_waker.register(cx.waker());
@@ -275,7 +342,15 @@ impl<'d> RingBufferedUartRx<'d> {
                 // Instead, return from this future and we'll check the length afterwards.
                 let eager = s.eager_reads.load(Ordering::Relaxed) > 0;
 
-                let idle = check_idle_and_errors(self.info.regs)?;
+                let status = check_line_status(regs);
+                if let Some(error) = status.error {
+                    if stop_on_line_error {
+                        return Poll::Ready(Err(error));
+                    }
+                    line_errors.record(error);
+                }
+                regs.cr1().modify(|w| w.set_idleie(true));
+                let idle = status.idle;
                 if idle || (eager && uart_init) {
                     // Idle line is detected, or eager reads is set and some data is available.
                     Poll::Ready(Ok(idle))
@@ -337,7 +412,13 @@ impl Drop for RingBufferedUartRx<'_> {
     }
 }
 
-/// Check and clear idle and error interrupts, return true if idle, Err(e) on error
+/// Idle and error flags read and cleared together by [`check_line_status`].
+struct LineStatus {
+    idle: bool,
+    error: Option<Error>,
+}
+
+/// Check and clear idle and error interrupts, returning the idle flag and the first error
 ///
 /// All flags are read and cleared in a single step, respectively. When more than one flag is set
 /// at the same time, all flags will be cleared but only one flag will be reported. So the other
@@ -345,7 +426,7 @@ impl Drop for RingBufferedUartRx<'_> {
 ///
 /// For usart_v1 and usart_v2, all status flags must be handled together anyway because all flags
 /// are cleared by a single read to the RDR register.
-fn check_idle_and_errors(r: Regs) -> Result<bool, Error> {
+fn check_line_status(r: Regs) -> LineStatus {
     // SAFETY: read only and we only use Rx related flags
     let sr = sr(r).read();
 
@@ -356,18 +437,18 @@ fn check_idle_and_errors(r: Regs) -> Result<bool, Error> {
     };
     clear_interrupt_flags(r, sr);
 
-    if sr.pe() {
-        Err(Error::Parity)
+    let error = if sr.pe() {
+        Some(Error::Parity)
     } else if sr.fe() {
-        Err(Error::Framing)
+        Some(Error::Framing)
     } else if sr.ne() {
-        Err(Error::Noise)
+        Some(Error::Noise)
     } else if sr.ore() {
-        Err(Error::Overrun)
+        Some(Error::Overrun)
     } else {
-        r.cr1().modify(|w| w.set_idleie(true));
-        Ok(sr.idle())
-    }
+        None
+    };
+    LineStatus { idle: sr.idle(), error }
 }
 
 impl embedded_io_async::ErrorType for RingBufferedUartRx<'_> {
