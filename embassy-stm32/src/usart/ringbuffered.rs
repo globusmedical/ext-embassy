@@ -171,6 +171,14 @@ impl<'d> RingBufferedUartRx<'d> {
             // enable DMA Rx Request
             w.set_dmar(true);
         });
+
+        // Discard what arrived while the DMA request was off. The DMA takes a byte only when
+        // one arrives, so bytes already waiting in the RX FIFO stay there: the ring then
+        // receives the oldest waiting byte for every new one and never catches up, and the
+        // full FIFO overruns again. Flushed after the request is enabled, so a byte that
+        // arrives after the flush raises a request of its own.
+        #[cfg(any(usart_v3, usart_v4))]
+        r.rqr().write(|w| w.set_rxfrq(true));
     }
 
     /// Stop DMA backed UART receiver
