@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased - ReleaseDate
 
 CAN:
-- fix: stm32/usart: `RingBufferedUartRx` restarts reception before reporting a line error, and clears the ring when it restarts, so a stopped receiver no longer returns `Overrun` forever (the restart order is upstream e9fb6fa31).
+- fix: stm32/usart: `RingBufferedUartRx` restarts reception before reporting a line error, and clears the ring when it restarts, so a stopped receiver no longer returns `Overrun` forever (the restart order is upstream e9fb6fa31). It also flushes the RX FIFO when it restarts: bytes left there from while the DMA request was off kept the ring one FIFO behind for good.
 - fix: stm32/can/fdcan: write `FilterType::Range` bounds in the correct order (`from`→SFID1/EFID1, `to`→SFID2/EFID2). The swapped order prevented normal multi-ID ranges from matching, breaking both accepting and rejecting range filters.
 
 DMA:
