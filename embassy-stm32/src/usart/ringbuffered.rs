@@ -227,9 +227,14 @@ impl<'d> RingBufferedUartRx<'d> {
     /// not previously been called, or if an error was detected which
     /// caused background reception to be stopped).
     ///
-    /// Background reception is terminated when an error is returned.
-    /// It must be started again by calling `start_uart()` or by
-    /// calling a read function again.
+    /// A line error that is already pending when `read()` is called is
+    /// returned after background reception has been restarted, so reception
+    /// keeps running.
+    ///
+    /// An error detected while reading or waiting for bytes (a ring buffer
+    /// overrun or a line error) terminates background reception. It must be
+    /// started again by calling `start_uart()` or by calling a read function
+    /// again.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         self.start_dma_or_check_errors()?;
 
