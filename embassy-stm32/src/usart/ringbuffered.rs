@@ -149,9 +149,11 @@ impl<'d> RingBufferedUartRx<'d> {
     /// Note: This is also done automatically by the read functions if
     /// required.
     pub fn start_uart(&mut self) {
-        // Clear the buffer so that it is ready to receive data
+        // Clear the buffer so that it is ready to receive data. After an error the read
+        // position is stale; without the clear every read reports an overrun again.
         compiler_fence(Ordering::SeqCst);
         self.ring_buf.start();
+        self.ring_buf.clear();
 
         let r = self.info.regs;
         // clear all interrupts and DMA Rx Request
@@ -169,6 +171,14 @@ impl<'d> RingBufferedUartRx<'d> {
             // enable DMA Rx Request
             w.set_dmar(true);
         });
+
+        // Discard what arrived while the DMA request was off. The DMA takes a byte only when
+        // one arrives, so bytes already waiting in the RX FIFO stay there: the ring then
+        // receives the oldest waiting byte for every new one and never catches up, and the
+        // full FIFO overruns again. Flushed after the request is enabled, so a byte that
+        // arrives after the flush raises a request of its own.
+        #[cfg(any(usart_v3, usart_v4))]
+        r.rqr().write(|w| w.set_rxfrq(true));
     }
 
     /// Stop DMA backed UART receiver
@@ -200,10 +210,13 @@ impl<'d> RingBufferedUartRx<'d> {
     fn start_dma_or_check_errors(&mut self) -> Result<(), Error> {
         let r = self.info.regs;
 
-        check_idle_and_errors(r)?;
+        // Restart before reporting an error: with the DMA stopped, every byte that arrives
+        // sets the overrun flag again, so returning first would never restart reception.
+        let status = check_idle_and_errors(r);
         if !r.cr3().read().dmar() {
             self.start_uart();
         }
+        status?;
         Ok(())
     }
 
@@ -214,9 +227,14 @@ impl<'d> RingBufferedUartRx<'d> {
     /// not previously been called, or if an error was detected which
     /// caused background reception to be stopped).
     ///
-    /// Background reception is terminated when an error is returned.
-    /// It must be started again by calling `start_uart()` or by
-    /// calling a read function again.
+    /// A line error that is already pending when `read()` is called is
+    /// returned after background reception has been restarted, so reception
+    /// keeps running.
+    ///
+    /// An error detected while reading or waiting for bytes (a ring buffer
+    /// overrun or a line error) terminates background reception. It must be
+    /// started again by calling `start_uart()` or by calling a read function
+    /// again.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         self.start_dma_or_check_errors()?;
 
